@@ -11,6 +11,12 @@ near real time.
 [![Python CI](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions/workflows/python-ci.yml/badge.svg)](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer)
+
+**Live demo:** Frontend at <https://imap-ialirt-explorer.vercel.app>. The
+frontend is static and will display a "Backend not configured" banner until
+the FastAPI service is deployed (see *Deploy* below). Use the Deploy-to-Render
+button above for a one-click backend (it picks up `render.yaml`).
 
 ## What This Solves
 
