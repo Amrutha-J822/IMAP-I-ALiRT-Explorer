@@ -38,17 +38,30 @@ def main() -> None:
 
     separator("1. Fetch MAG data")
     start = time.perf_counter()
-    mag = ie.fetch_latest("mag", days=7)
-    log.info("Loaded %d rows from %s in %.2fs", len(mag), mag.attrs.get("source"), time.perf_counter() - start)
+    mag = ie.fetch_latest("mag", days=1)
+    log.info(
+        "Loaded %d rows from %s in %.2fs",
+        len(mag),
+        mag.attrs.get("source"),
+        time.perf_counter() - start,
+    )
     log.info("Columns: %s", ", ".join(mag.columns))
 
     separator("2. Analyze and calibrate")
     stats = ie.analyze(mag)
-    calibrated = ie.calibrate_mag(mag, method="offset")
+    suggestion = ie.suggest_calibration_method(mag)
+    log.info("Suggested calibration: %s (%s)", suggestion["recommendation"], suggestion["rationale"])
+    calibrated = ie.calibrate_mag(mag, method=suggestion["recommendation"])
+    quality = ie.calibration_quality(mag, calibrated)
     drift_delta = float(np.nanstd(mag["Bz_nT"]) - np.nanstd(calibrated["Bz_nT"]))
     log.info("Duration: %.1f hours", stats["duration_hours"])
     log.info("Cadence: %.0f seconds", stats["cadence_seconds"])
     log.info("Bz standard-deviation change after calibration: %.3f nT", drift_delta)
+    log.info(
+        "Baseline removed: %.2f nT, residual drift: %.3f nT/h",
+        quality.get("baseline_amplitude_nT", float("nan")),
+        quality.get("residual_drift_per_hour_nT", float("nan")),
+    )
 
     separator("3. Detect candidate events")
     flagged = ie.detect_anomalies(calibrated, "mag", sigma_threshold=3.0)
@@ -56,7 +69,7 @@ def main() -> None:
     log.info("Southward Bz intervals: %d", int(flagged.get("storm_southward_Bz", []).sum()))
 
     separator("4. Compute pressure terms")
-    swapi = ie.fetch_latest("swapi", days=7)
+    swapi = ie.fetch_latest("swapi", days=1)
     pressure = ie.compute_pressures(calibrated, swapi)
     if pressure.empty:
         log.info("No overlapping MAG/SWAPI samples available.")
@@ -66,7 +79,7 @@ def main() -> None:
 
     separator("5. Parallel multi-instrument analysis")
     start = time.perf_counter()
-    results = ie.parallel_analyze(["mag", "swe", "swapi", "hit"], days=3)
+    results = ie.parallel_analyze(["mag", "swe", "swapi", "hit"], days=1)
     log.info("Analyzed %d instruments in %.2fs", len(results), time.perf_counter() - start)
     for instrument, result in sorted(results.items()):
         log.info(

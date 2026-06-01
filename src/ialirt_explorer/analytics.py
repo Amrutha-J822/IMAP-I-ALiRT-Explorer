@@ -233,6 +233,229 @@ def detect_anomalies(
     return flags
 
 
+CALIBRATION_METHODS: tuple[str, ...] = ("offset", "detrend", "zscore")
+
+
+def calibration_quality(
+    raw: pd.DataFrame, calibrated: pd.DataFrame, *, columns: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    """Quantify what a MAG calibration step actually did to the data.
+
+    Researchers cannot trust calibration they cannot inspect. This returns
+    per-component metrics describing the magnitude of the baseline that was
+    removed, the residual drift after calibration, the noise floor, and how
+    correlated the calibrated trace is with the raw input.
+
+    Notes
+    -----
+    - ``baseline_amplitude_nT`` reports the peak-to-peak amplitude of the
+      signal that calibration subtracted. A large value with a slow trend
+      indicates an instrumental offset; a small value indicates the raw data
+      was already stable.
+    - ``residual_drift_per_hour_nT`` is the slope of the calibrated series
+      against time. Close to zero means the baseline really has been removed.
+    - ``raw_calibrated_correlation`` close to 1.0 means the high-frequency
+      structure is preserved (calibration only removed low-frequency drift).
+    """
+
+    columns = columns or MAG_VECTOR_COLUMNS
+    metrics: dict[str, dict[str, float]] = {}
+
+    for column in columns:
+        if column not in raw or column not in calibrated:
+            continue
+        raw_series = raw[column].astype(float)
+        cal_series = calibrated[column].astype(float)
+        baseline = (raw_series - cal_series).dropna()
+        if baseline.empty:
+            continue
+
+        if isinstance(cal_series.index, pd.DatetimeIndex) and len(cal_series) > 1:
+            elapsed_hours = np.asarray(
+                (cal_series.index - cal_series.index[0]).total_seconds() / 3600,
+                dtype=np.float64,
+            )
+            values = cal_series.to_numpy(dtype=np.float64)
+            mask = np.isfinite(values)
+            if mask.sum() >= 2:
+                slope, _ = np.polyfit(elapsed_hours[mask], values[mask], deg=1)
+            else:
+                slope = float("nan")
+        else:
+            slope = float("nan")
+
+        diff = cal_series.diff().abs().dropna()
+        noise_floor = float(diff.quantile(0.5)) if not diff.empty else float("nan")
+
+        corr = float(raw_series.corr(cal_series))
+
+        metrics[column] = {
+            "baseline_amplitude_nT": float(baseline.max() - baseline.min()),
+            "baseline_mean_offset_nT": float(baseline.mean()),
+            "residual_drift_per_hour_nT": float(slope),
+            "noise_floor_nT": noise_floor,
+            "raw_calibrated_correlation": corr,
+            "std_before_nT": float(raw_series.std(ddof=0)),
+            "std_after_nT": float(cal_series.std(ddof=0)),
+        }
+
+    if not metrics:
+        return {}
+
+    total_baseline = float(
+        np.mean([m["baseline_amplitude_nT"] for m in metrics.values()])
+    )
+    total_drift = float(
+        np.mean([abs(m["residual_drift_per_hour_nT"]) for m in metrics.values()])
+    )
+    return {
+        "per_component": metrics,
+        "baseline_amplitude_nT": total_baseline,
+        "residual_drift_per_hour_nT": total_drift,
+        "method": calibrated.attrs.get("calibration_method", "unknown"),
+    }
+
+
+def compare_calibration_methods(
+    df: pd.DataFrame,
+    *,
+    methods: tuple[str, ...] = CALIBRATION_METHODS,
+    window: int = 121,
+) -> dict[str, dict[str, Any]]:
+    """Run several calibration methods on the same MAG frame and return metrics.
+
+    The returned dict is keyed by method name. Each entry contains the
+    quality metrics from :func:`calibration_quality` along with a compact
+    per-component summary so a UI can render side-by-side comparisons
+    without recomputing.
+    """
+
+    _require_columns(df, MAG_VECTOR_COLUMNS, "Calibration comparison")
+    results: dict[str, dict[str, Any]] = {}
+    for method in methods:
+        calibrated = calibrate_mag(df, method=method, window=window)
+        quality = calibration_quality(df, calibrated)
+        results[method] = {
+            "quality": quality,
+            "score": _calibration_score(quality),
+        }
+    return results
+
+
+def _calibration_score(quality: dict[str, Any]) -> float:
+    """Heuristic combined score in [0, 1].
+
+    Higher is better. Penalizes large residual drift and rewards preservation
+    of high-frequency structure (raw <-> calibrated correlation).
+    """
+
+    if not quality:
+        return 0.0
+    drift = quality.get("residual_drift_per_hour_nT", float("nan"))
+    drift_score = math.exp(-abs(drift) / 0.5) if math.isfinite(drift) else 0.0
+
+    components = quality.get("per_component", {})
+    if components:
+        correlations = [m["raw_calibrated_correlation"] for m in components.values()]
+        corr_score = float(np.nanmean(correlations))
+    else:
+        corr_score = 0.0
+
+    return float(np.clip(0.5 * drift_score + 0.5 * corr_score, 0.0, 1.0))
+
+
+def suggest_calibration_method(
+    df: pd.DataFrame, *, window: int = 121
+) -> dict[str, Any]:
+    """Suggest the calibration method best suited to a MAG frame.
+
+    The heuristic inspects each MAG component for:
+
+    - a slow monotonic trend (-> ``detrend``)
+    - a wandering DC offset relative to the noise floor (-> ``offset``)
+    - already-stable data with no significant baseline (-> ``zscore`` to
+      simply standardize for downstream comparison)
+    """
+
+    _require_columns(df, MAG_VECTOR_COLUMNS, "Calibration suggestion")
+    diagnostics: dict[str, dict[str, float]] = {}
+    method_votes: dict[str, int] = {method: 0 for method in CALIBRATION_METHODS}
+    any_strong_trend = False
+    any_strong_offset = False
+
+    for column in MAG_VECTOR_COLUMNS:
+        series = df[column].astype(float).dropna()
+        if len(series) < 8:
+            continue
+        baseline = series.rolling(window=window, center=True, min_periods=5).median()
+        baseline = baseline.bfill().ffill()
+        baseline_amplitude = float(baseline.max() - baseline.min())
+        noise_floor = float(series.diff().abs().median())
+
+        if isinstance(series.index, pd.DatetimeIndex):
+            elapsed_hours = (
+                series.index - series.index[0]
+            ).total_seconds().to_numpy() / 3600
+        else:
+            elapsed_hours = np.arange(len(series), dtype=np.float64)
+        slope, _ = np.polyfit(elapsed_hours, series.to_numpy(dtype=np.float64), deg=1)
+        trend_strength = abs(slope) * (elapsed_hours[-1] - elapsed_hours[0])
+
+        diagnostics[column] = {
+            "baseline_amplitude_nT": baseline_amplitude,
+            "noise_floor_nT": noise_floor,
+            "linear_trend_total_nT": float(trend_strength),
+        }
+
+        if trend_strength > 3 * max(noise_floor, 1e-6) and trend_strength > 2.0:
+            method_votes["detrend"] += 1
+            any_strong_trend = True
+        elif baseline_amplitude > 5 * max(noise_floor, 1e-6) and baseline_amplitude > 1.5:
+            method_votes["offset"] += 1
+            any_strong_offset = True
+        else:
+            method_votes["zscore"] += 1
+
+    # Priority: a sustained linear trend on *any* component requires a detrend
+    # step before the other components can be compared. A wandering DC offset on
+    # any component justifies an offset removal. Otherwise standardize.
+    if any_strong_trend:
+        chosen = "detrend"
+    elif any_strong_offset:
+        chosen = "offset"
+    elif any(method_votes.values()):
+        chosen = max(method_votes, key=method_votes.get)
+    else:
+        chosen = "offset"
+
+    return {
+        "recommendation": chosen,
+        "votes": method_votes,
+        "diagnostics": diagnostics,
+        "rationale": _explain_recommendation(chosen, diagnostics),
+    }
+
+
+def _explain_recommendation(method: str, diagnostics: dict[str, dict[str, float]]) -> str:
+    if method == "detrend":
+        return (
+            "At least one component shows a sustained linear trend several times "
+            "larger than the noise floor; subtracting a linear fit will preserve "
+            "the AC signal while removing the drift."
+        )
+    if method == "offset":
+        return (
+            "Components show a wandering DC baseline larger than the noise floor; "
+            "a rolling-median offset is the conservative choice and leaves the "
+            "high-frequency structure intact."
+        )
+    return (
+        "Baseline drift is comparable to the noise floor. Z-score standardization "
+        "is appropriate for cross-instrument comparison; no real calibration is "
+        "required."
+    )
+
+
 def compute_pressures(mag_df: pd.DataFrame, swapi_df: pd.DataFrame) -> pd.DataFrame:
     """Compute solar-wind pressure terms from MAG and SWAPI measurements."""
 

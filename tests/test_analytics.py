@@ -5,12 +5,16 @@ import pandas as pd
 import pytest
 
 from ialirt_explorer.analytics import (
+    CALIBRATION_METHODS,
     _rolling_below_threshold,
     _rolling_zscore_array,
     analyze,
     calibrate_mag,
+    calibration_quality,
+    compare_calibration_methods,
     compute_pressures,
     detect_anomalies,
+    suggest_calibration_method,
 )
 from ialirt_explorer.ingestion import _synthetic_data
 
@@ -128,6 +132,67 @@ def test_rolling_zscore_detects_large_outlier() -> None:
     result = _rolling_zscore_array(values, window=20)
 
     assert abs(result[40]) > 5
+
+
+@pytest.mark.parametrize("method", CALIBRATION_METHODS)
+def test_calibration_quality_returns_expected_fields(
+    mag_df: pd.DataFrame, method: str
+) -> None:
+    calibrated = calibrate_mag(mag_df, method=method)
+    quality = calibration_quality(mag_df, calibrated)
+
+    assert "per_component" in quality
+    for column in ("Bx_nT", "By_nT", "Bz_nT"):
+        component = quality["per_component"][column]
+        for key in (
+            "baseline_amplitude_nT",
+            "residual_drift_per_hour_nT",
+            "raw_calibrated_correlation",
+            "std_before_nT",
+            "std_after_nT",
+        ):
+            assert key in component
+    assert quality["method"] == method
+
+
+def test_compare_calibration_methods_runs_all_known_methods(
+    mag_df: pd.DataFrame,
+) -> None:
+    comparison = compare_calibration_methods(mag_df)
+
+    assert set(comparison) == set(CALIBRATION_METHODS)
+    for entry in comparison.values():
+        assert 0.0 <= entry["score"] <= 1.0
+        assert entry["quality"]["per_component"]
+
+
+def test_suggest_calibration_recommends_detrend_for_strong_linear_trend(
+    mag_df: pd.DataFrame,
+) -> None:
+    trended = mag_df.copy()
+    trended["Bz_nT"] = trended["Bz_nT"] + np.linspace(0, 200, len(trended))
+
+    suggestion = suggest_calibration_method(trended)
+
+    assert suggestion["recommendation"] == "detrend"
+    assert "trend" in suggestion["rationale"].lower()
+
+
+def test_suggest_calibration_recommends_offset_for_dc_baseline(
+    mag_df: pd.DataFrame,
+) -> None:
+    offset = mag_df.copy()
+    bump = np.concatenate(
+        [
+            np.zeros(len(offset) // 2),
+            np.ones(len(offset) - len(offset) // 2) * 25,
+        ]
+    )
+    offset["Bz_nT"] = offset["Bz_nT"] + bump
+
+    suggestion = suggest_calibration_method(offset)
+
+    assert suggestion["recommendation"] in {"offset", "detrend"}
 
 
 def test_rolling_below_threshold_requires_sustained_interval() -> None:

@@ -1,49 +1,54 @@
 # IMAP I-ALiRT Explorer
 
-Research-grade Python tooling for discovering, loading, calibrating, analyzing,
-and visualizing public IMAP I-ALiRT space-weather data.
+Live ingestion, calibration, analytics, and visualization tooling for the
+public IMAP I-ALiRT space-weather feed.
 
-The project is designed as a small but complete research software engineering
-example: official data access, reproducible offline behavior, typed modular
-Python, NumPy/Pandas analytics, Numba-ready kernels, publication-quality plots,
-pytest coverage, and GitHub Actions CI.
+The project pairs a Python backend (FastAPI + asyncio pub/sub) with a
+React/TypeScript frontend so researchers can subscribe to the instruments
+they care about and see calibrated, anomaly-flagged time series update in
+near real time.
 
 [![Python CI](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions/workflows/python-ci.yml/badge.svg)](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Why This Matters
+## What This Solves
 
-I-ALiRT gives researchers near-real-time IMAP measurements for space-weather
-monitoring. The scientific value is high, but the workflow can be slow:
-researchers must discover files, download mission-format data, align
-multi-instrument timestamps, inspect calibration drift, and produce readable
-figures before they can ask the actual science question.
+I-ALiRT delivers near-real-time IMAP measurements for space-weather
+monitoring. Turning that telemetry into actionable views is normally a
+multi-step chore: locating files in the Science Data Center, decoding
+CDFs, aligning instrument cadences, removing baseline drift, and screening
+for events. This project compresses the whole loop into a service:
 
-This project focuses on that pain point. It turns I-ALiRT data into clean,
-analysis-ready DataFrames and flags candidate events fast enough for interactive
-research.
-
-| Research pain point | What the project provides |
+| Researcher pain point | What the project provides |
 | --- | --- |
-| File discovery across mission products | `list_available()` wraps the official SDC query interface |
-| Live data loading with unstable networks | Official `imap-data-access` first, REST second, deterministic fallback for CI |
-| MAG baseline drift and confusing vector plots | `calibrate_mag()` normalizes vector components and recomputes `|B|` |
-| Event screening by eye | `detect_anomalies()` flags spikes, southward Bz intervals, high-speed streams, and particle enhancements |
-| Multi-instrument bottlenecks | `parallel_analyze()` fetches and analyzes MAG, SWE, SWAPI, and HIT concurrently |
+| File discovery across mission products | `list_available()` wraps the `/ialirt-archive-query` endpoint |
+| Live data behind a REST endpoint | `fetch_space_weather()` and a background poller that publishes to subscribers |
+| MAG baseline drift and confusing vector plots | `calibrate_mag()` plus a Calibration Lab UI that compares methods side-by-side |
+| Event screening by eye | `detect_anomalies()` flags spikes, southward Bz, high-speed streams, particle enhancements |
+| Multi-instrument bottlenecks | `parallel_analyze()` fetches and analyzes MAG, SWE, SWAPI, HIT, and CoDICE concurrently |
+| Real-time dashboards | FastAPI WebSocket pub/sub plus a React/TS frontend |
 
 ## Data Source
 
-The primary data path is the official `imap-data-access` Python package, which
-queries and downloads files from the IMAP Science Data Center API:
+The backend talks to the public I-ALiRT API hosted by the IMAP Science
+Operations Center at the Laboratory for Atmospheric and Space Physics:
 
 ```text
-https://api.imap-mission.com
+https://ialirt.imap-mission.com
 ```
 
-Public I-ALiRT access does not require API keys. Optional authentication
-variables are supported in `.env.example` for protected or unreleased products,
-but this repository does not contain secrets.
+The primary live feed is the `/space-weather` endpoint; archived CDF
+products are discovered through `/ialirt-archive-query` and downloaded
+through `/ialirt-download/archive/<filename>`. Public access does not
+require credentials. For protected/unreleased data, set `IMAP_API_KEY`
+and point `IALIRT_DATA_ACCESS_URL` at the `/api-key` prefix as documented
+by the IMAP SOC.
+
+When the [`ialirt-data-access`](https://github.com/IMAP-Science-Operations-Center/ialirt-data-access)
+package is installed, ingestion prefers it for queries and downloads;
+otherwise the code falls back to direct REST requests using the same
+endpoints.
 
 Supported instruments:
 
@@ -53,48 +58,53 @@ Supported instruments:
 | `swe` | Solar-wind electrons | `electron_density_cc`, `electron_temp_K`, `heat_flux` |
 | `swapi` | Solar-wind ions | `proton_speed_km_s`, `proton_density_cc`, `proton_temp_K` |
 | `hit` | Energetic particles | `h_flux`, `he_flux`, `heavy_ion_flux` |
+| `codice_lo` | Low-energy ions | `ion_flux_low_energy`, `ion_temp_K` |
+| `codice_hi` | High-energy ions | `ion_flux_high_energy`, `energetic_ion_temp_K` |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A["IMAP SDC API"] --> B["imap-data-access"]
-    B --> C["ingestion.py"]
-    A --> D["REST fallback"]
-    D --> C
-    E["Synthetic fallback"] --> C
-    C --> F["Pandas DataFrames"]
-    F --> G["NumPy / Numba analytics"]
-    F --> H["MAG calibration"]
-    G --> I["Anomaly flags"]
-    H --> I
-    F --> J["Pressure physics"]
-    I --> K["Matplotlib + Seaborn figures"]
-    J --> K
-    F --> L["Parallel multi-instrument runs"]
+    A["IMAP I-ALiRT API<br/>ialirt.imap-mission.com"] --> B["Async Poller"]
+    B --> C["In-memory Pub/Sub Broker"]
+    C --> D["FastAPI REST + WebSocket"]
+    D --> E["React + TypeScript UI"]
+    D --> F["Python clients<br/>(fetch_space_weather, parallel_analyze)"]
+    A --> G["Archive CDF downloads"]
+    G --> H["cdflib parser"]
+    H --> D
 ```
 
-More detail: [docs/architecture.md](docs/architecture.md)
+The pub/sub broker is in-memory and lives inside the FastAPI process. It is
+deliberately small: a slow consumer cannot back up the broker because each
+subscriber owns a bounded queue and old messages are dropped on overflow.
+For multi-process deployments the broker can be swapped for Redis Pub/Sub
+or NATS without changing the WebSocket contract.
+
+More detail: [docs/architecture.md](docs/architecture.md).
 
 ## Repository Layout
 
 ```text
 imap-ialirt-explorer/
 ├── src/ialirt_explorer/
-│   ├── ingestion.py       # official IMAP SDC package, REST fallback, CDF parsing
-│   ├── analytics.py       # NumPy statistics, calibration, anomaly detection, pressure physics
-│   ├── parallel.py        # concurrent multi-instrument orchestration
-│   └── visualization.py   # Matplotlib/Seaborn dashboards
-├── tests/                 # pytest unit tests with mocks and parametrization
-├── docs/                  # architecture notes
-├── .github/workflows/     # CI on push and pull request
-├── demo.py                # end-to-end example pipeline
-├── pyproject.toml         # package metadata and tool config
-├── requirements.txt       # pip-friendly dependency list
-└── .env.example           # documented optional environment variables
+│   ├── ingestion.py          # ialirt-data-access + REST against ialirt.imap-mission.com
+│   ├── analytics.py          # statistics, calibration helpers, anomaly detection, pressures
+│   ├── parallel.py           # concurrent multi-instrument orchestration
+│   ├── visualization.py      # Matplotlib/Seaborn dashboards
+│   └── service/
+│       ├── api.py            # FastAPI app: REST + WebSocket
+│       ├── poller.py         # background task that publishes live samples
+│       └── pubsub.py         # async in-memory broker
+├── frontend/                 # React + TypeScript (Vite) UI
+├── tests/                    # pytest unit and integration tests
+├── docs/                     # architecture notes
+├── .github/workflows/        # CI on push and pull request
+├── demo.py                   # end-to-end Python example pipeline
+└── pyproject.toml
 ```
 
-## Quickstart
+## Quickstart (Backend)
 
 ```bash
 python3 -m venv .venv
@@ -103,75 +113,131 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-Run the full demo:
+Run the live service (FastAPI + background poller + WebSocket):
 
 ```bash
-python demo.py
+ialirt-explorer-service
+# equivalent to: uvicorn ialirt_explorer.service.api:app --host 0.0.0.0 --port 8000
 ```
 
-The demo writes:
+Useful endpoints (auto-documented at <http://127.0.0.1:8000/docs>):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/healthz` | Service health + poller status |
+| `GET` | `/instruments` | List supported instruments and cadence |
+| `GET` | `/snapshot/{instrument}` | One-shot frame + stats + anomalies; supports `?calibrate=true&method=offset` |
+| `GET` | `/calibration/mag/suggest` | Heuristic recommendation for the active baseline behavior |
+| `GET` | `/calibration/mag/compare` | Run all calibration methods and return quality metrics for each |
+| `WS`  | `/ws?instruments=mag,swapi` | Subscribe to live samples; one JSON message per new sample |
+
+Environment variables (see `.env.example`):
 
 ```text
-output_mag_dashboard.png
-output_mag_timeseries.png
-output_mag_hodogram.png
-output_anomaly_summary.png
-output_multi_instrument.png
+IALIRT_DATA_ACCESS_URL=https://ialirt.imap-mission.com
+IMAP_API_KEY=
+IALIRT_POLL_INTERVAL_SECONDS=30
+IALIRT_LOOKBACK_MINUTES=60
+IALIRT_SERVICE_HOST=0.0.0.0
+IALIRT_SERVICE_PORT=8000
 ```
 
-If the live API or CDF parser is unavailable, the same pipeline runs against
-deterministic physically plausible data. That makes interviews, CI, and offline
-development reproducible.
+## Quickstart (Frontend)
 
-## Example Usage
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The Vite dev server runs on <http://127.0.0.1:5173> and proxies `/api`
+and `/ws` to the FastAPI service on port 8000. A production build:
+
+```bash
+npm run build
+npm run preview
+```
+
+When a researcher selects an instrument, the UI immediately:
+
+1. Pulls a one-shot snapshot via `/snapshot/{instrument}` and renders the
+   time series, summary stats, and anomaly flags.
+2. Subscribes to the WebSocket topic for that instrument so any new
+   samples published by the poller are appended to the chart in place.
+3. For MAG, queries `/calibration/mag/compare` so the Calibration Lab can
+   display side-by-side method scores, baseline amplitudes, residual
+   drift, and a recommended method.
+
+## Example Usage (Python)
 
 ```python
 import ialirt_explorer as ie
 
-mag = ie.fetch_latest("mag", days=3)
+mag = ie.fetch_latest("mag", days=1)
 calibrated = ie.calibrate_mag(mag, method="offset")
+quality = ie.calibration_quality(mag, calibrated)
 flagged = ie.detect_anomalies(calibrated, "mag", sigma_threshold=3.0)
 
-print(ie.analyze(calibrated))
+print(quality["baseline_amplitude_nT"], quality["residual_drift_per_hour_nT"])
 print(flagged["any_anomaly"].value_counts())
+```
 
-ie.plot_dashboard(calibrated, instrument="mag", save_path="mag_dashboard.png")
+Suggest the right calibration method based on the current data:
+
+```python
+recommendation = ie.suggest_calibration_method(mag)
+print(recommendation["recommendation"], recommendation["rationale"])
+
+comparison = ie.compare_calibration_methods(mag)
+for method, entry in comparison.items():
+    print(method, entry["score"], entry["quality"]["residual_drift_per_hour_nT"])
 ```
 
 Multi-instrument workflow:
 
 ```python
-results = ie.parallel_analyze(["mag", "swe", "swapi", "hit"], days=2)
+results = ie.parallel_analyze(["mag", "swe", "swapi", "hit"], days=1)
 for instrument, result in results.items():
     print(instrument, result["stats"]["n_rows"], result["flagged"]["any_anomaly"].sum())
 ```
 
-Pressure calculation:
+## Calibration Lab
 
-```python
-mag = ie.calibrate_mag(ie.fetch_latest("mag", days=3))
-swapi = ie.fetch_latest("swapi", days=3)
-pressure = ie.compute_pressures(mag, swapi)
-print(pressure[["P_ram_nPa", "P_mag_nPa", "P_total_nPa", "plasma_beta"]].tail())
-```
+`calibrate_mag()` removes baseline drift, but a researcher cannot accept
+calibration they cannot inspect. The package exposes three helpers, all
+surfaced in the frontend Calibration Lab:
+
+- `compare_calibration_methods(df)` runs `offset`, `detrend`, and
+  `zscore` and returns per-component quality metrics for each.
+- `calibration_quality(raw, calibrated)` quantifies what calibration did:
+  baseline amplitude removed, residual drift per hour, noise floor,
+  correlation between raw and calibrated traces, std before and after.
+- `suggest_calibration_method(df)` votes per MAG component based on the
+  ratio of baseline amplitude and linear trend strength against the noise
+  floor, and returns a plain-English rationale for the recommendation.
+
+The UI shows all three methods in one table, highlights the recommended
+choice, and lets the researcher apply any of them to the live snapshot
+with one click.
 
 ## Tests
 
 ```bash
 pytest
-pytest tests/test_analytics.py -q
 pytest --cov=ialirt_explorer --cov-report=term-missing
 ```
 
 Coverage focuses on:
 
-- instrument schema validation and deterministic fallback data
-- mocked SDC query parsing
+- ingestion REST mocks for `/space-weather` and `/ialirt-archive-query`
+- deterministic fallback data per instrument
 - MAG calibration behavior and `|B|` recomputation
+- calibration quality metrics and method recommendation
 - rolling z-score and sustained-threshold kernels
-- anomaly flags for MAG, SWAPI, SWE, and HIT
+- anomaly flags for MAG, SWAPI, SWE, HIT, CoDICE
 - solar-wind pressure calculations
-- parallel orchestration result shape
+- pub/sub broker delivery semantics (matching topics, queue overflow, latest cache)
+- FastAPI endpoints with patched ingestion
 
 ## CI/CD
 
@@ -181,28 +247,33 @@ Coverage focuses on:
 2. lint `src/` and `tests/` with Ruff
 3. run `pytest` with coverage
 
-This mirrors the kind of reproducible review workflow expected in a research
-software engineering team.
-
 ## Deployment
 
-The core project is a Python research package and does not need deployment.
-For a lightweight web version, the current package can be wrapped by a small
-FastAPI service and deployed behind a static Vercel or Netlify frontend. The
-existing API boundaries were chosen so that the backend can stay server-side and
-the browser never needs IMAP credentials or mission-specific data logic.
+The backend ships as a single FastAPI process. A typical production
+deployment uses `uvicorn` behind a TLS-terminating reverse proxy:
 
-## Notes For Reviewers
+```bash
+uvicorn ialirt_explorer.service.api:app --host 0.0.0.0 --port 8000 --workers 1
+```
 
-- No API keys or secrets are committed.
-- Live data access is isolated to `ingestion.py`; tests mock network behavior.
+The frontend is a static SPA produced by `npm run build` and can be
+served from any CDN or static host. Point it at the FastAPI service via
+`VITE_BACKEND_HTTP` and `VITE_BACKEND_WS` at build time.
+
+## Engineering Notes
+
+- No API keys or secrets are committed; the optional `IMAP_API_KEY`
+  variable is read at runtime if elevated permissions are needed.
+- Live data access is isolated to `ingestion.py`; tests mock network
+  behavior.
 - Analysis code uses explicit units in column names.
-- Numba is optional on Python 3.13, where upstream wheel support may lag; the
-  pure-Python fallback keeps the package functional.
-- Algorithms are intentionally transparent screening tools, not mission
-  calibration replacements.
+- Numba is optional on Python 3.13, where upstream wheel support may lag;
+  the pure-Python fallback keeps the package functional.
+- The calibration helpers are transparent screening tools, not
+  replacements for mission-level calibration products from the SOC.
 
 ## References
 
+- [IMAP Science Operations Center on GitHub](https://github.com/IMAP-Science-Operations-Center)
+- [ialirt-data-access on GitHub](https://github.com/IMAP-Science-Operations-Center/ialirt-data-access)
 - [IMAP Data Access API documentation](https://imap-processing.readthedocs.io/en/latest/data-access/index.html)
-- [imap-data-access on PyPI](https://pypi.org/project/imap-data-access/)
