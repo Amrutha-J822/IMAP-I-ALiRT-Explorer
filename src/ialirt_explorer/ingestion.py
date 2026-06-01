@@ -2,16 +2,23 @@
 
 Primary endpoint: ``https://ialirt.imap-mission.com``
 
-The module prefers the official ``ialirt-data-access`` Python package when it is
-installed, then falls back to direct REST calls against the documented public
-endpoints, and finally to a deterministic synthetic generator so demos, tests,
-and CI keep working without network.
+Schema notes (probed against the live API):
 
-Public endpoints (per the IMAP SOC documentation):
+- ``GET /space-weather?instrument=<name>`` returns
+  ``{"meta": {"count": N, ...}, "data": [<record>, ...]}``.
+- Variable names are prefixed by instrument and vector fields are encoded as
+  3- or 4-element lists (e.g. ``mag_B_GSE: [bx, by, bz]``,
+  ``codice_hi_h: [e0, e1, e2, e3]``).
+- ``time_utc`` is an ISO-8601 string per record.
+- Each record may have non-trivial nulls (e.g. CoDICE composition ratios can
+  be ``None`` when not yet computed).
+- Open-ended queries return the most recent ~5 minutes of samples. Queries
+  with explicit ``time_utc_start`` / ``time_utc_end`` longer than that
+  return a 400 ``"too much data"`` response.
 
-- ``GET /space-weather`` - live per-instrument data (the primary feed)
-- ``GET /ialirt-archive-query`` - list archived CDF files
-- ``GET /ialirt-download/<filetype>/<filename>`` - retrieve archived files
+- ``GET /ialirt-archive-query`` returns ``{"files": [<filename>, ...]}`` -
+  a list of bare CDF filenames, not records.
+- ``GET /ialirt-download/archive/<filename>`` streams the CDF body.
 """
 
 from __future__ import annotations
@@ -19,9 +26,10 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,41 +55,117 @@ class InstrumentSpec:
     columns: tuple[str, ...]
 
 
+def _coerce_float(value: Any) -> float:
+    try:
+        if value is None:
+            return float("nan")
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _vector_component(record: dict[str, Any], key: str, index: int) -> float:
+    value = record.get(key)
+    if isinstance(value, list) and len(value) > index:
+        return _coerce_float(value[index])
+    return float("nan")
+
+
+def _extract_mag(record: dict[str, Any]) -> dict[str, float]:
+    return {
+        "Bx_nT": _vector_component(record, "mag_B_GSE", 0),
+        "By_nT": _vector_component(record, "mag_B_GSE", 1),
+        "Bz_nT": _vector_component(record, "mag_B_GSE", 2),
+        "B_total_nT": _coerce_float(record.get("mag_B_magnitude")),
+    }
+
+
+def _extract_swapi(record: dict[str, Any]) -> dict[str, float]:
+    return {
+        "proton_speed_km_s": _coerce_float(record.get("swapi_pseudo_proton_speed")),
+        "proton_density_cc": _coerce_float(record.get("swapi_pseudo_proton_density")),
+        "proton_temp_K": _coerce_float(record.get("swapi_pseudo_proton_temperature")),
+    }
+
+
+def _extract_swe(record: dict[str, Any]) -> dict[str, float]:
+    counts = record.get("swe_normalized_counts")
+    if isinstance(counts, list) and counts:
+        valid = [_coerce_float(value) for value in counts]
+        valid = [value for value in valid if np.isfinite(value)]
+        mean_val = float(np.mean(valid)) if valid else float("nan")
+        max_val = float(np.max(valid)) if valid else float("nan")
+    else:
+        mean_val = float("nan")
+        max_val = float("nan")
+    return {
+        "electron_counts_mean": mean_val,
+        "electron_counts_max": max_val,
+        "counterstreaming_flag": _coerce_float(record.get("swe_counterstreaming_electrons")),
+    }
+
+
+def _extract_hit(record: dict[str, Any]) -> dict[str, float]:
+    return {
+        "h_low_en": _coerce_float(record.get("hit_h_omni_low_en")),
+        "h_med_en": _coerce_float(record.get("hit_h_omni_med_en")),
+        "he_low_en": _coerce_float(record.get("hit_he_omni_low_en")),
+        "he_high_en": _coerce_float(record.get("hit_he_omni_high_en")),
+        "e_a_med_en": _coerce_float(record.get("hit_e_a_side_med_en")),
+        "e_b_med_en": _coerce_float(record.get("hit_e_b_side_med_en")),
+    }
+
+
+def _extract_codice_lo(record: dict[str, Any]) -> dict[str, float]:
+    return {
+        "c_over_o": _coerce_float(record.get("codice_lo_c_over_o_abundance")),
+        "fe_over_o": _coerce_float(record.get("codice_lo_fe_over_o_abundance")),
+        "mg_over_o": _coerce_float(record.get("codice_lo_mg_over_o_abundance")),
+        "o7_over_o6": _coerce_float(record.get("codice_lo_o_plus_7_over_o_plus_6")),
+        "c6_over_c5": _coerce_float(record.get("codice_lo_c_plus_6_over_c_plus_5")),
+        "fe_low_over_fe_high": _coerce_float(record.get("codice_lo_fe_low_over_fe_high")),
+    }
+
+
+def _extract_codice_hi(record: dict[str, Any]) -> dict[str, float]:
+    return {
+        "h_e0": _vector_component(record, "codice_hi_h", 0),
+        "h_e1": _vector_component(record, "codice_hi_h", 1),
+        "h_e2": _vector_component(record, "codice_hi_h", 2),
+        "h_e3": _vector_component(record, "codice_hi_h", 3),
+    }
+
+
 IALIRT_INSTRUMENTS: dict[str, InstrumentSpec] = {
-    "mag": InstrumentSpec("mag", 1, ("Bx_nT", "By_nT", "Bz_nT", "B_total_nT")),
-    "swe": InstrumentSpec(
-        "swe", 12, ("electron_density_cc", "electron_temp_K", "heat_flux")
-    ),
+    "mag": InstrumentSpec("mag", 4, ("Bx_nT", "By_nT", "Bz_nT", "B_total_nT")),
     "swapi": InstrumentSpec(
         "swapi", 30, ("proton_speed_km_s", "proton_density_cc", "proton_temp_K")
     ),
-    "hit": InstrumentSpec("hit", 60, ("h_flux", "he_flux", "heavy_ion_flux")),
+    "swe": InstrumentSpec(
+        "swe", 12, ("electron_counts_mean", "electron_counts_max", "counterstreaming_flag")
+    ),
+    "hit": InstrumentSpec(
+        "hit",
+        60,
+        ("h_low_en", "h_med_en", "he_low_en", "he_high_en", "e_a_med_en", "e_b_med_en"),
+    ),
     "codice_lo": InstrumentSpec(
-        "codice_lo", 60, ("ion_flux_low_energy", "ion_temp_K")
+        "codice_lo",
+        60,
+        ("c_over_o", "fe_over_o", "mg_over_o", "o7_over_o6", "c6_over_c5", "fe_low_over_fe_high"),
     ),
     "codice_hi": InstrumentSpec(
-        "codice_hi", 60, ("ion_flux_high_energy", "energetic_ion_temp_K")
+        "codice_hi", 60, ("h_e0", "h_e1", "h_e2", "h_e3")
     ),
 }
 
-VARIABLE_ALIASES: dict[str, tuple[str, ...]] = {
-    "Bx_nT": ("bx_gse", "bx", "b_gse_x", "mag_x", "x", "Bx"),
-    "By_nT": ("by_gse", "by", "b_gse_y", "mag_y", "y", "By"),
-    "Bz_nT": ("bz_gse", "bz", "b_gse_z", "mag_z", "z", "Bz"),
-    "B_total_nT": ("bt", "btotal", "b_total", "mag_total", "magnitude", "|B|"),
-    "proton_speed_km_s": ("proton_speed", "speed", "v_sw", "velocity", "vp"),
-    "proton_density_cc": ("proton_density", "density", "n_p", "np"),
-    "proton_temp_K": ("proton_temperature", "temperature", "t_p", "tp"),
-    "electron_density_cc": ("electron_density", "n_e", "ne"),
-    "electron_temp_K": ("electron_temperature", "t_e", "te"),
-    "heat_flux": ("heat_flux", "q_e", "strahl"),
-    "h_flux": ("h_flux", "proton_flux", "hydrogen_flux"),
-    "he_flux": ("he_flux", "helium_flux", "alpha_flux"),
-    "heavy_ion_flux": ("heavy_ion_flux", "ion_flux", "z_gt_2_flux"),
-    "ion_flux_low_energy": ("low_energy_flux", "lo_flux", "codice_lo_flux"),
-    "ion_temp_K": ("ion_temperature", "t_i", "ti"),
-    "ion_flux_high_energy": ("high_energy_flux", "hi_flux", "codice_hi_flux"),
-    "energetic_ion_temp_K": ("energetic_temp", "t_ei"),
+_EXTRACTORS: dict[str, Callable[[dict[str, Any]], dict[str, float]]] = {
+    "mag": _extract_mag,
+    "swapi": _extract_swapi,
+    "swe": _extract_swe,
+    "hit": _extract_hit,
+    "codice_lo": _extract_codice_lo,
+    "codice_hi": _extract_codice_hi,
 }
 
 
@@ -121,38 +205,20 @@ def _api_headers() -> dict[str, str]:
     return headers
 
 
-def _normalize_records(payload: Any) -> list[dict[str, Any]]:
-    """Coerce a heterogeneous API response into a list of record dicts."""
+def _records_from_space_weather(payload: Any) -> list[dict[str, Any]]:
+    """Extract the per-sample record list from a /space-weather response."""
 
-    if payload is None:
-        return []
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
     if isinstance(payload, dict):
-        for key in ("data", "results", "items", "records", "body"):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        for key in ("results", "items", "records", "body"):
             inner = payload.get(key)
             if isinstance(inner, list):
                 return [item for item in inner if isinstance(item, dict)]
-        if all(isinstance(value, list) for value in payload.values()) and payload:
-            length = min(len(v) for v in payload.values())
-            return [
-                {column: payload[column][i] for column in payload}
-                for i in range(length)
-            ]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
     return []
-
-
-def _find_first(record: dict[str, Any], options: tuple[str, ...]) -> Any:
-    lower_map = {key.lower(): key for key in record}
-    for option in options:
-        if option.lower() in lower_map:
-            return record[lower_map[option.lower()]]
-    for option in options:
-        option_lower = option.lower()
-        for lower_key, original in lower_map.items():
-            if option_lower in lower_key:
-                return record[original]
-    return None
 
 
 def _records_to_frame(
@@ -161,11 +227,12 @@ def _records_to_frame(
     if not records:
         return pd.DataFrame()
 
-    time_keys = ("time_utc", "epoch", "timestamp", "met_in_utc", "time", "date")
+    extractor = _EXTRACTORS[spec.instrument]
     times: list[Any] = []
+    rows: list[dict[str, float]] = []
     for record in records:
-        raw_time = _find_first(record, time_keys)
-        times.append(raw_time)
+        times.append(record.get("time_utc") or record.get("epoch") or record.get("timestamp"))
+        rows.append(extractor(record))
 
     try:
         index = pd.to_datetime(times, utc=True, errors="coerce")
@@ -177,36 +244,30 @@ def _records_to_frame(
                 freq=f"{max(spec.cadence_seconds, 1)}s",
             )
         )
-    if index.isna().all():
-        index = pd.DatetimeIndex(
-            pd.date_range(
-                end=pd.Timestamp.now(tz="UTC").floor("s"),
-                periods=len(records),
-                freq=f"{max(spec.cadence_seconds, 1)}s",
-            )
-        )
 
-    columns: dict[str, list[float]] = {column: [] for column in spec.columns}
-    for record in records:
-        for column in spec.columns:
-            aliases = VARIABLE_ALIASES.get(column, (column,))
-            value = _find_first(record, aliases)
-            try:
-                columns[column].append(float(value))
-            except (TypeError, ValueError):
-                columns[column].append(np.nan)
-
-    frame = pd.DataFrame(columns, index=pd.DatetimeIndex(index, name="time"))
+    frame = pd.DataFrame(rows, index=pd.DatetimeIndex(index, name="time"))
+    frame = frame[~frame.index.isna()]
     frame = frame.sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
 
-    if spec.instrument == "mag" and {"Bx_nT", "By_nT", "Bz_nT"}.issubset(frame.columns):
-        frame["B_total_nT"] = np.sqrt(
+    # Ensure schema columns are always present in stable order, even if a
+    # particular record omitted a field (e.g. CoDICE composition nulls).
+    for column in spec.columns:
+        if column not in frame.columns:
+            frame[column] = np.nan
+    frame = frame[list(spec.columns)]
+
+    if spec.instrument == "mag" and "B_total_nT" in frame.columns:
+        derived_total = np.sqrt(
             frame["Bx_nT"] ** 2 + frame["By_nT"] ** 2 + frame["Bz_nT"] ** 2
         )
+        # If the API didn't include the magnitude (or it's NaN), fall back to
+        # the derived value; otherwise trust the mission-provided value.
+        frame["B_total_nT"] = frame["B_total_nT"].where(
+            frame["B_total_nT"].notna(), derived_total
+        )
 
-    frame = frame.dropna(how="all")
-    return frame
+    return frame.dropna(how="all")
 
 
 def _query_space_weather_package(
@@ -231,7 +292,7 @@ def _query_space_weather_package(
                 if time_utc_end is not None:
                     kwargs["time_utc_end"] = time_utc_end
                 result = func(**kwargs)
-                normalized = _normalize_records(result)
+                normalized = _records_from_space_weather(result)
                 if normalized:
                     return normalized
             except Exception as exc:  # pragma: no cover - depends on remote state
@@ -246,7 +307,15 @@ def _query_space_weather_rest(
     time_utc_start: str | None,
     time_utc_end: str | None,
 ) -> list[dict[str, Any]]:
-    params = {"instrument": instrument}
+    """Direct REST call against /space-weather.
+
+    Open-ended queries (no time params) return the most recent samples; the
+    endpoint enforces a small window and returns HTTP 400 if a longer window
+    is requested. Callers can pass a narrow window when they care about a
+    specific interval.
+    """
+
+    params: dict[str, str] = {"instrument": instrument}
     if time_utc_start is not None:
         params["time_utc_start"] = time_utc_start
     if time_utc_end is not None:
@@ -268,7 +337,7 @@ def _query_space_weather_rest(
         payload = response.json()
     except ValueError:
         return []
-    return _normalize_records(payload)
+    return _records_from_space_weather(payload)
 
 
 def fetch_space_weather(
@@ -283,7 +352,8 @@ def fetch_space_weather(
 
     Tries the ``ialirt-data-access`` Python package first, falls back to the
     documented public REST endpoint, and finally to deterministic synthetic
-    data if both fail and ``fallback=True``.
+    data if both fail and ``fallback=True``. When no time window is given
+    the endpoint returns its native recent-samples window (~5 minutes).
     """
 
     spec = _validate_instrument(instrument)
@@ -317,11 +387,7 @@ async def fetch_space_weather_async(
     time_utc_start: str | None = None,
     time_utc_end: str | None = None,
 ) -> pd.DataFrame:
-    """Async variant of :func:`fetch_space_weather` for the live poller.
-
-    Uses the provided ``httpx.AsyncClient`` so callers can pool connections
-    across many polling cycles.
-    """
+    """Async variant of :func:`fetch_space_weather` for the live poller."""
 
     spec = _validate_instrument(instrument)
     params: dict[str, str] = {"instrument": spec.instrument}
@@ -340,11 +406,33 @@ async def fetch_space_weather_async(
         log.info("async /space-weather failed for %s: %s", spec.instrument, exc)
         return pd.DataFrame()
 
-    frame = _records_to_frame(_normalize_records(payload), spec)
+    frame = _records_to_frame(_records_from_space_weather(payload), spec)
     if not frame.empty:
         frame.attrs["source"] = "ialirt-sdc"
         frame.attrs["instrument"] = spec.instrument
     return frame
+
+
+def _records_from_archive(payload: Any) -> list[dict[str, Any]]:
+    """Adapt /ialirt-archive-query response to a list of record dicts."""
+
+    if isinstance(payload, dict):
+        files = payload.get("files")
+        if isinstance(files, list):
+            return [{"filename": str(name)} for name in files if name]
+        for key in ("data", "results", "items", "records", "body"):
+            inner = payload.get(key)
+            if isinstance(inner, list):
+                return [
+                    item if isinstance(item, dict) else {"filename": str(item)}
+                    for item in inner
+                ]
+    if isinstance(payload, list):
+        return [
+            item if isinstance(item, dict) else {"filename": str(item)}
+            for item in payload
+        ]
+    return []
 
 
 def list_available(
@@ -359,8 +447,9 @@ def list_available(
 ) -> list[dict[str, Any]]:
     """List archived I-ALiRT CDF files using ``/ialirt-archive-query``.
 
-    The optional ``instrument`` filter is applied client-side since the
-    public endpoint groups archive products together.
+    The response is normalized to ``[{"filename": str}, ...]`` so callers
+    don't have to special-case the bare-string list shape returned by the
+    server.
     """
 
     params: dict[str, str | int] = {"version": version}
@@ -382,7 +471,7 @@ def list_available(
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        records = _normalize_records(response.json())
+        records = _records_from_archive(response.json())
     except (requests.RequestException, ValueError) as exc:
         log.info("REST /ialirt-archive-query failed: %s", exc)
         return []
@@ -393,7 +482,7 @@ def list_available(
     return [
         record
         for record in records
-        if instrument_lower in str(record).lower()
+        if instrument_lower in record.get("filename", "").lower()
     ]
 
 
@@ -406,7 +495,9 @@ def _download_archive_with_package(filename: str, target_dir: Path) -> Path | No
     if not callable(download):
         return None
     try:
-        result = download(filetype="archive", filename=filename, downloads_dir=str(target_dir))
+        result = download(
+            filetype="archive", filename=filename, downloads_dir=str(target_dir)
+        )
     except Exception as exc:  # pragma: no cover - depends on remote state
         log.info("ialirt_data_access.download failed for %s: %s", filename, exc)
         return None
@@ -473,52 +564,38 @@ def _cdf_time_index(cdf: Any, n_rows: int) -> pd.DatetimeIndex:
     )
 
 
-def _first_matching_variable(cdf: Any, options: tuple[str, ...]) -> np.ndarray | None:
-    info = cdf.cdf_info()
-    variables = list(getattr(info, "zVariables", []) or []) + list(
-        getattr(info, "rVariables", []) or []
-    )
-    lower_map = {var.lower(): var for var in variables}
-    for option in options:
-        if option.lower() in lower_map:
-            return np.asarray(cdf.varget(lower_map[option.lower()]), dtype=float)
-    for option in options:
-        option_lower = option.lower()
-        for lower, original in lower_map.items():
-            if option_lower in lower:
-                return np.asarray(cdf.varget(original), dtype=float)
-    return None
-
-
 def _read_cdf(path: Path, instrument: str) -> pd.DataFrame:
+    """Read a CDF file. CDF parsing is best-effort - returns whatever
+    numeric variables it can recognize and aligns them on a common index."""
+
     try:
         from cdflib import CDF
     except ImportError as exc:
         raise RuntimeError("cdflib is required to parse CDF files") from exc
 
-    spec = _validate_instrument(instrument)
+    _validate_instrument(instrument)
     with CDF(str(path)) as cdf:
+        info = cdf.cdf_info()
+        variables = list(getattr(info, "zVariables", []) or []) + list(
+            getattr(info, "rVariables", []) or []
+        )
         columns: dict[str, np.ndarray] = {}
-        for target_col in spec.columns:
-            values = _first_matching_variable(
-                cdf, VARIABLE_ALIASES.get(target_col, (target_col,))
-            )
-            if values is not None:
-                columns[target_col] = np.ravel(values).astype(float)
-
+        for var in variables:
+            if "epoch" in var.lower() or "time" in var.lower():
+                continue
+            try:
+                values = np.asarray(cdf.varget(var), dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if values.ndim == 1:
+                columns[var] = values
         if not columns:
-            raise ValueError(f"No recognized {instrument} variables in {path}")
-
+            raise ValueError(f"No numeric variables in {path}")
         n_rows = min(len(values) for values in columns.values())
         index = _cdf_time_index(cdf, n_rows)
         frame = pd.DataFrame(
             {key: value[:n_rows] for key, value in columns.items()},
             index=index[:n_rows],
-        )
-
-    if instrument == "mag" and {"Bx_nT", "By_nT", "Bz_nT"}.issubset(frame.columns):
-        frame["B_total_nT"] = np.sqrt(
-            frame["Bx_nT"] ** 2 + frame["By_nT"] ** 2 + frame["Bz_nT"] ** 2
         )
     frame.index.name = "time"
     return frame.sort_index()
@@ -533,10 +610,7 @@ def fetch_archive(
     api_url: str = DEFAULT_API_URL,
     fallback: bool = True,
 ) -> pd.DataFrame:
-    """Fetch archived CDF data for an instrument.
-
-    Useful for replaying historic events alongside the live feed.
-    """
+    """Fetch archived CDF data for an instrument."""
 
     spec = _validate_instrument(instrument)
     records = list_available(
@@ -554,8 +628,10 @@ def fetch_archive(
         tmp_path = Path(tmp)
 
         def _fetch_one(record: dict[str, Any]) -> pd.DataFrame | None:
-            filename = record.get("filename") or record.get("file_name") or record.get(
-                "file_path"
+            filename = (
+                record.get("filename")
+                or record.get("file_name")
+                or record.get("file_path")
             )
             if not filename:
                 return None
@@ -600,51 +676,31 @@ def fetch_archive(
 def fetch_latest(
     instrument: str,
     *,
-    days: int = 1,
+    days: int = 1,  # noqa: ARG001 - retained for backward compatibility
     api_url: str = DEFAULT_API_URL,
     fallback: bool = True,
 ) -> pd.DataFrame:
     """Fetch the most recent live I-ALiRT samples for an instrument.
 
-    Tries the live ``/space-weather`` endpoint first; if no live samples
-    are available the archive endpoint is consulted; finally falls back to
-    synthetic data if both are empty and ``fallback=True``.
+    The ``/space-weather`` endpoint serves a fixed recent-samples window
+    (open-ended queries return the latest available data and explicit long
+    windows are rejected). The ``days`` argument is kept for API
+    compatibility but does not widen the window beyond what the endpoint
+    allows; the archive endpoint covers longer ranges.
     """
 
-    end = datetime.now(tz=UTC)
-    start = end - timedelta(days=max(days, 0), minutes=0)
-    frame = pd.DataFrame()
-
     try:
-        frame = fetch_space_weather(
-            instrument,
-            time_utc_start=start,
-            time_utc_end=end,
-            api_url=api_url,
-            fallback=False,
-        )
+        frame = fetch_space_weather(instrument, api_url=api_url, fallback=False)
     except RuntimeError:
         frame = pd.DataFrame()
 
     if not frame.empty:
         return frame
 
-    try:
-        frame = fetch_archive(
-            instrument,
-            since=start.date(),
-            api_url=api_url,
-            fallback=False,
-        )
-        if not frame.empty:
-            return frame
-    except RuntimeError:
-        pass
-
     if not fallback:
         raise RuntimeError(f"No I-ALiRT data available for {instrument!r}")
 
-    return _synthetic_data(instrument, days=days)
+    return _synthetic_data(instrument, days=1)
 
 
 def fetch_range(
@@ -657,8 +713,8 @@ def fetch_range(
 ) -> pd.DataFrame:
     """Fetch I-ALiRT data over an explicit date range.
 
-    Combines live ``/space-weather`` samples (when the range overlaps the
-    last ~24h) and archive CDF products when available.
+    Combines archive CDF products (best for historical windows) with the
+    live ``/space-weather`` tail (the most recent few minutes).
     """
 
     spec = _validate_instrument(instrument)
@@ -666,8 +722,6 @@ def fetch_range(
     try:
         live = fetch_space_weather(
             spec.instrument,
-            time_utc_start=start_date,
-            time_utc_end=end_date,
             api_url=api_url,
             fallback=False,
         )
@@ -683,6 +737,12 @@ def fetch_range(
         )
     except RuntimeError:
         archive = pd.DataFrame()
+
+    # Optional client-side trim
+    if end_date is not None:
+        end_ts = pd.Timestamp(_iso_utc(end_date) or end_date, tz="UTC")
+        live = live[live.index <= end_ts] if not live.empty else live
+        archive = archive[archive.index <= end_ts] if not archive.empty else archive
 
     frames = [df for df in (archive, live) if not df.empty]
     if frames:
@@ -703,18 +763,20 @@ def _synthetic_data(
     instrument: str,
     *,
     n_points: int | None = None,
-    days: int = 7,
+    days: int = 1,
     seed: int = 42,
 ) -> pd.DataFrame:
     """Generate deterministic, physically plausible I-ALiRT-like data.
 
     Used when the upstream API is unreachable, so dashboards, tests, and the
-    pub/sub service remain demonstrable offline.
+    pub/sub service remain demonstrable offline. The generated frames carry
+    the same column schema that the real API returns, so downstream code
+    does not need to special-case the fallback path.
     """
 
     spec = _validate_instrument(instrument)
     if n_points is None:
-        cadence = max(spec.cadence_seconds, 300)
+        cadence = max(spec.cadence_seconds, 60)
         n_points = max(12, int(days * 24 * 3600 / cadence))
 
     rng = np.random.default_rng(seed + sum(ord(char) for char in spec.instrument))
@@ -729,14 +791,14 @@ def _synthetic_data(
     slow = np.linspace(-1.0, 1.0, n_points, dtype=np.float64)
 
     if spec.instrument == "mag":
-        bx = 4.5 * np.sin(phase) + 0.8 * rng.normal(size=n_points) + 0.7 * slow
-        by = 3.0 * np.cos(phase / 2.0) + 0.7 * rng.normal(size=n_points) - 0.3 * slow
-        bz = 2.0 * np.sin(phase / 3.0) + 0.9 * rng.normal(size=n_points) + 1.4 * slow
+        bx = 2.3 + 0.5 * np.sin(phase) + 0.4 * rng.normal(size=n_points) + 0.2 * slow
+        by = -4.2 + 0.4 * np.cos(phase / 2.0) + 0.5 * rng.normal(size=n_points)
+        bz = -4.7 + 0.3 * np.sin(phase / 3.0) + 0.5 * rng.normal(size=n_points)
         if n_points > 80:
             event = slice(n_points // 2, min(n_points, n_points // 2 + max(6, n_points // 40)))
             bz[event] -= 7.0
             bx[event] += 3.0
-        data = {
+        data: dict[str, np.ndarray] = {
             "Bx_nT": bx,
             "By_nT": by,
             "Bz_nT": bz,
@@ -757,40 +819,48 @@ def _synthetic_data(
             "proton_temp_K": np.clip(temp, 10_000, None),
         }
     elif spec.instrument == "swe":
-        density = 7 + 1.1 * np.sin(phase / 2.0) + rng.normal(0, 0.35, n_points)
-        temp = 130_000 + 20_000 * np.cos(phase / 2.8) + rng.normal(0, 6_000, n_points)
-        heat_flux = 0.8 + 0.25 * np.sin(phase) + rng.normal(0, 0.05, n_points)
+        mean_counts = 50 + 15 * np.sin(phase / 2.0) + rng.normal(0, 4, n_points)
+        max_counts = mean_counts * (1.4 + 0.2 * np.cos(phase / 3.0))
+        flag = (rng.random(n_points) > 0.7).astype(float)
         data = {
-            "electron_density_cc": np.clip(density, 0.1, None),
-            "electron_temp_K": np.clip(temp, 20_000, None),
-            "heat_flux": np.clip(heat_flux, 0.01, None),
+            "electron_counts_mean": np.clip(mean_counts, 1.0, None),
+            "electron_counts_max": np.clip(max_counts, 1.0, None),
+            "counterstreaming_flag": flag,
         }
     elif spec.instrument == "hit":
-        h_flux = rng.lognormal(mean=2.0, sigma=0.25, size=n_points)
-        he_flux = rng.lognormal(mean=0.9, sigma=0.25, size=n_points)
-        heavy = rng.lognormal(mean=0.25, sigma=0.3, size=n_points)
+        h_low = rng.poisson(lam=3, size=n_points).astype(float)
+        h_med = rng.poisson(lam=1, size=n_points).astype(float)
+        he_low = rng.poisson(lam=0.5, size=n_points).astype(float)
+        he_high = rng.poisson(lam=0.2, size=n_points).astype(float)
+        e_a = rng.poisson(lam=18, size=n_points).astype(float)
+        e_b = rng.poisson(lam=22, size=n_points).astype(float)
         if n_points > 80:
             event = slice(n_points // 2, min(n_points, n_points // 2 + max(6, n_points // 30)))
-            h_flux[event] *= 8
-            he_flux[event] *= 5
-            heavy[event] *= 4
-        data = {"h_flux": h_flux, "he_flux": he_flux, "heavy_ion_flux": heavy}
-    elif spec.instrument == "codice_lo":
-        low_flux = rng.lognormal(mean=1.5, sigma=0.4, size=n_points)
-        ion_temp = 1.0e5 + 1.5e4 * np.sin(phase / 2.4) + rng.normal(0, 6_000, n_points)
+            h_low[event] *= 8
+            he_low[event] *= 5
         data = {
-            "ion_flux_low_energy": low_flux,
-            "ion_temp_K": np.clip(ion_temp, 5_000, None),
+            "h_low_en": h_low,
+            "h_med_en": h_med,
+            "he_low_en": he_low,
+            "he_high_en": he_high,
+            "e_a_med_en": e_a,
+            "e_b_med_en": e_b,
+        }
+    elif spec.instrument == "codice_lo":
+        data = {
+            "c_over_o": 0.7 + 0.05 * np.sin(phase / 2) + rng.normal(0, 0.02, n_points),
+            "fe_over_o": 0.13 + 0.02 * np.cos(phase / 3) + rng.normal(0, 0.01, n_points),
+            "mg_over_o": 0.15 + 0.02 * np.sin(phase / 4) + rng.normal(0, 0.01, n_points),
+            "o7_over_o6": 0.20 + 0.05 * np.sin(phase / 2.5) + rng.normal(0, 0.02, n_points),
+            "c6_over_c5": 0.50 + 0.10 * np.cos(phase / 3) + rng.normal(0, 0.03, n_points),
+            "fe_low_over_fe_high": 1.0 + 0.2 * np.sin(phase / 4) + rng.normal(0, 0.05, n_points),
         }
     else:  # codice_hi
-        hi_flux = rng.lognormal(mean=1.0, sigma=0.5, size=n_points)
-        energetic_temp = (
-            5.0e5 + 5.0e4 * np.sin(phase / 3.0) + rng.normal(0, 20_000, n_points)
-        )
-        data = {
-            "ion_flux_high_energy": hi_flux,
-            "energetic_ion_temp_K": np.clip(energetic_temp, 5e4, None),
-        }
+        h_e0 = rng.poisson(lam=5, size=n_points).astype(float)
+        h_e1 = rng.poisson(lam=3, size=n_points).astype(float)
+        h_e2 = rng.poisson(lam=1.5, size=n_points).astype(float)
+        h_e3 = rng.poisson(lam=0.8, size=n_points).astype(float)
+        data = {"h_e0": h_e0, "h_e1": h_e1, "h_e2": h_e2, "h_e3": h_e3}
 
     frame = pd.DataFrame(data, index=index)
     frame.attrs["source"] = "synthetic-fallback"

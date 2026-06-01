@@ -12,7 +12,6 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -40,9 +39,6 @@ class PollerConfig:
     )
     poll_interval_seconds: float = field(
         default_factory=lambda: float(os.environ.get("IALIRT_POLL_INTERVAL_SECONDS", "30"))
-    )
-    lookback_minutes: int = field(
-        default_factory=lambda: int(os.environ.get("IALIRT_LOOKBACK_MINUTES", "60"))
     )
     instruments: tuple[str, ...] = field(
         default_factory=lambda: tuple(IALIRT_INSTRUMENTS)
@@ -128,12 +124,9 @@ class IALiRTPoller:
 
         assert self._client is not None, "Poller must be started before polling"
 
-        end = datetime.now(tz=UTC)
-        start = end - timedelta(minutes=self.config.lookback_minutes)
         results: dict[str, int] = {}
-
         tasks = [
-            self._poll_instrument(instrument, start, end)
+            self._poll_instrument(instrument)
             for instrument in self.config.instruments
         ]
         for instrument, count in zip(
@@ -144,18 +137,18 @@ class IALiRTPoller:
             results[instrument] = count
         return results
 
-    async def _poll_instrument(
-        self, instrument: str, start: datetime, end: datetime
-    ) -> int:
+    async def _poll_instrument(self, instrument: str) -> int:
+        """Pull the latest open-ended window from /space-weather.
+
+        The endpoint returns its native recent-samples window for queries
+        without explicit time bounds and rejects long explicit windows with
+        a 400, so we let it pick the window and deduplicate locally.
+        """
+
         assert self._client is not None
 
         try:
-            frame = await fetch_space_weather_async(
-                self._client,
-                instrument,
-                time_utc_start=start.strftime("%Y-%m-%dT%H:%M:%S"),
-                time_utc_end=end.strftime("%Y-%m-%dT%H:%M:%S"),
-            )
+            frame = await fetch_space_weather_async(self._client, instrument)
         except Exception as exc:  # pragma: no cover - upstream surprises
             log.warning("Polling %s failed: %s", instrument, exc)
             frame = pd.DataFrame()

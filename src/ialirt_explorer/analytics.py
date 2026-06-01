@@ -217,12 +217,32 @@ def detect_anomalies(
                 df["proton_density_cc"].to_numpy(dtype=np.float64) >= 12.0
             )
     elif instrument == "hit":
-        flux_cols = [column for column in df.columns if "flux" in column]
-        if flux_cols:
-            baseline = df[flux_cols].median()
-            flags["energetic_particle_enhancement"] = (df[flux_cols] > 4 * baseline).any(axis=1)
-    elif instrument == "swe" and "heat_flux" in df:
-        flags["electron_heat_flux_enhancement"] = df["heat_flux"].to_numpy(dtype=np.float64) >= 1.5
+        rate_cols = [column for column in df.columns if column.endswith("_en")]
+        if rate_cols:
+            baseline = df[rate_cols].median().replace(0, 1.0)
+            flags["energetic_particle_enhancement"] = (
+                df[rate_cols] > 4 * baseline
+            ).any(axis=1)
+    elif instrument == "swe":
+        if "electron_counts_max" in df:
+            flags["electron_burst"] = (
+                df["electron_counts_max"].to_numpy(dtype=np.float64) >= 200.0
+            )
+        if "counterstreaming_flag" in df:
+            flags["counterstreaming_electrons"] = (
+                df["counterstreaming_flag"].fillna(0).to_numpy(dtype=np.float64) >= 1.0
+            )
+    elif instrument in {"codice_lo", "codice_hi"}:
+        numeric_cols = [
+            column for column in df.columns if pd.api.types.is_numeric_dtype(df[column])
+        ]
+        if numeric_cols:
+            valid = df[numeric_cols].dropna(how="all")
+            if not valid.empty:
+                baseline = valid.median(skipna=True).replace(0, 1.0)
+                flags["composition_excursion"] = (
+                    (df[numeric_cols] > 3 * baseline).any(axis=1).fillna(False)
+                )
 
     boolean_cols = [
         column
