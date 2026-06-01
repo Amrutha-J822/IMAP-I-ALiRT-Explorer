@@ -1,6 +1,5 @@
 # IMAP I-ALiRT Explorer
 
-> **A live dashboard for NASA's IMAP satellite.** It pulls solar-weather measurements off the spacecraft as they stream down, cleans up the magnetic-field signal, flags unusual activity, and plots everything on a chart that updates in real time.
 
 [![Python CI](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions/workflows/python-ci.yml/badge.svg)](https://github.com/Amrutha-J822/IMAP-I-ALiRT-Explorer/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
@@ -15,7 +14,6 @@
 | Backend health | <https://imap-ialirt-explorer-api.onrender.com/healthz> |
 | OpenAPI docs | <https://imap-ialirt-explorer-api.onrender.com/docs> |
 
-The Render backend uses the free tier and sleeps after ~15 minutes of inactivity; the first request after a sleep takes ~30 s to cold-start, then the WebSocket reconnects automatically.
 
 ## What This Solves
 
