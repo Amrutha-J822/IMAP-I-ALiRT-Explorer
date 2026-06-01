@@ -11,6 +11,7 @@ const SNAPSHOT_REFRESH_MS = 30_000;
 
 export default function App() {
   const [instruments, setInstruments] = useState<InstrumentMeta[]>([]);
+  const [instrumentsLoadFailed, setInstrumentsLoadFailed] = useState<boolean>(false);
   const [selected, setSelected] = useState<string>("mag");
   const [calibrate, setCalibrate] = useState<boolean>(false);
   const [method, setMethod] = useState<string>("offset");
@@ -25,17 +26,20 @@ export default function App() {
     listInstruments()
       .then((list) => {
         setInstruments(list);
+        setInstrumentsLoadFailed(false);
         if (list.length > 0 && !list.find((entry) => entry.name === selected)) {
           setSelected(list[0].name);
         }
       })
-      .catch((err: Error) => setError(err.message));
+      .catch((err: Error) => {
+        setError(err.message);
+        setInstrumentsLoadFailed(true);
+      });
     // selected is intentionally not a dependency: this fetch only runs once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const backendUnreachable =
-    instruments.length === 0 && error !== null && !loadingSnapshot;
+  const backendUnreachable = instrumentsLoadFailed && instruments.length === 0;
 
   useEffect(() => {
     if (!selected) return;

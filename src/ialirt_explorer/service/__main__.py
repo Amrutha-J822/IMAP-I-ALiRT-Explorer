@@ -15,7 +15,12 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     host = os.environ.get("IALIRT_SERVICE_HOST", "0.0.0.0")
-    port = int(os.environ.get("IALIRT_SERVICE_PORT", "8000"))
+    # PORT is the platform-as-a-service convention (Render, Fly, Heroku, Cloud Run).
+    port = int(
+        os.environ.get("PORT")
+        or os.environ.get("IALIRT_SERVICE_PORT")
+        or "8000"
+    )
 
     uvicorn.run(
         "ialirt_explorer.service.api:app",
