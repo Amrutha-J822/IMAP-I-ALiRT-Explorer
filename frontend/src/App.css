@@ -354,3 +354,26 @@ body,
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
+
+.backend-notice {
+  border-color: rgba(245, 158, 11, 0.35);
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.06), var(--panel));
+}
+
+.backend-notice h2 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+.backend-notice ol {
+  margin: 10px 0 14px 20px;
+  line-height: 1.6;
+}
+
+.backend-notice code {
+  background: rgba(96, 165, 250, 0.12);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
