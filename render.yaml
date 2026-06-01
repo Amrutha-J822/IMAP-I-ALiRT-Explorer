@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: imap-ialirt-explorer-api
+    runtime: python
+    region: oregon
+    plan: free
+    autoDeploy: true
+    branch: main
+    rootDir: .
+    buildCommand: |
+      pip install --upgrade pip
+      pip install .
+    startCommand: ialirt-explorer-service
+    healthCheckPath: /healthz
+    envVars:
+      - key: IALIRT_DATA_ACCESS_URL
+        value: https://ialirt.imap-mission.com
+      - key: IALIRT_POLL_INTERVAL_SECONDS
+        value: "30"
+      - key: PYTHON_VERSION
+        value: "3.12.4"
