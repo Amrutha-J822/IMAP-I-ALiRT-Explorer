@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -27,6 +28,39 @@ from ialirt_explorer.service.poller import IALiRTPoller, PollerConfig
 from ialirt_explorer.service.pubsub import Broker
 
 log = logging.getLogger(__name__)
+
+# Single switch that gates *every* synthetic-fallback path the service can
+# take. Default: off, because the live deployment exists to serve real
+# I-ALiRT downlinks — not to fabricate plausible-looking samples when the
+# upstream returns empty. The library-level fetch_* helpers still default
+# to fallback=True so the offline test suite and notebooks keep working;
+# this knob narrows that down to "production service mode" only.
+_ALLOW_SYNTHETIC_ENV = "IALIRT_ALLOW_SYNTHETIC_FALLBACK"
+
+
+def _allow_synthetic_fallback() -> bool:
+    return os.environ.get(_ALLOW_SYNTHETIC_ENV, "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+async def _fetch_latest_or_empty(instrument: str, *, days: int) -> pd.DataFrame:
+    """Wrapper around :func:`fetch_latest` that honors the synthetic-fallback
+    kill switch and surfaces 'upstream had nothing' as an empty DataFrame
+    instead of fabricated rows.
+    """
+
+    allow_synth = _allow_synthetic_fallback()
+    try:
+        return await asyncio.to_thread(
+            fetch_latest, instrument, days=days, fallback=allow_synth
+        )
+    except RuntimeError as exc:
+        log.info("No upstream samples for %s: %s", instrument, exc)
+        return pd.DataFrame()
 
 
 def _frame_payload(frame: pd.DataFrame) -> dict[str, Any]:
@@ -112,7 +146,7 @@ def create_app(
     ) -> dict[str, Any]:
         if instrument not in IALIRT_INSTRUMENTS:
             raise HTTPException(status_code=404, detail=f"Unknown instrument {instrument!r}")
-        frame = await asyncio.to_thread(fetch_latest, instrument, days=days)
+        frame = await _fetch_latest_or_empty(instrument, days=days)
         applied_calibration: dict[str, Any] | None = None
         if calibrate and instrument == "mag":
             calibrated = calibrate_mag(frame, method=method)
@@ -151,7 +185,7 @@ def create_app(
                 status_code=400,
                 detail="Calibration tools are only defined for the MAG instrument.",
             )
-        frame = await asyncio.to_thread(fetch_latest, instrument, days=days)
+        frame = await _fetch_latest_or_empty(instrument, days=days)
         return suggest_calibration_method(frame)
 
     @app.get("/calibration/{instrument}/compare")
@@ -161,7 +195,7 @@ def create_app(
                 status_code=400,
                 detail="Calibration tools are only defined for the MAG instrument.",
             )
-        frame = await asyncio.to_thread(fetch_latest, instrument, days=days)
+        frame = await _fetch_latest_or_empty(instrument, days=days)
         return {
             "comparison": compare_calibration_methods(frame),
             "suggested": suggest_calibration_method(frame),

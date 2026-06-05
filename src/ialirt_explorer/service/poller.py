@@ -28,9 +28,23 @@ from ialirt_explorer.service.pubsub import Broker
 log = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class PollerConfig:
-    """Runtime configuration for the live poller."""
+    """Runtime configuration for the live poller.
+
+    ``fallback_to_synthetic`` defaults to ``False`` so the deployed service
+    only publishes real I-ALiRT downlinks. Opt in by setting
+    ``IALIRT_ALLOW_SYNTHETIC_FALLBACK=true`` if you want the poller to
+    invent deterministic placeholder rows when the upstream returns empty
+    (useful for offline demos, never appropriate for production).
+    """
 
     api_url: str = field(
         default_factory=lambda: os.environ.get(
@@ -43,7 +57,9 @@ class PollerConfig:
     instruments: tuple[str, ...] = field(
         default_factory=lambda: tuple(IALIRT_INSTRUMENTS)
     )
-    fallback_to_synthetic: bool = True
+    fallback_to_synthetic: bool = field(
+        default_factory=lambda: _env_flag("IALIRT_ALLOW_SYNTHETIC_FALLBACK", default=False)
+    )
 
 
 def _frame_to_records(frame: pd.DataFrame, instrument: str) -> list[dict[str, Any]]:

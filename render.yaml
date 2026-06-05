@@ -17,5 +17,11 @@ services:
         value: https://ialirt.imap-mission.com
       - key: IALIRT_POLL_INTERVAL_SECONDS
         value: "30"
+      # Hard guarantee that the live service NEVER fabricates samples to
+      # cover a quiet upstream. If ialirt.imap-mission.com is dry for an
+      # instrument, the frontend gets an empty frame; it does not get
+      # plausible-looking synthetic placeholders.
+      - key: IALIRT_ALLOW_SYNTHETIC_FALLBACK
+        value: "false"
       - key: PYTHON_VERSION
         value: "3.12.4"
