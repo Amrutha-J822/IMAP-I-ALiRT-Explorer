@@ -3,50 +3,56 @@
 Two compute backends are available, both as first-class, *installed* code
 paths:
 
-  * ``"threads"``: ``concurrent.futures.ThreadPoolExecutor``. The right pick
-    on a laptop, a Vercel preview, or the live Render container, because
-    ``_analyze_one`` is dominated by an HTTP fetch against
-    ``ialirt.imap-mission.com`` (I/O-bound); threads release the GIL during
-    ``socket.recv`` so we get real concurrency with no extra runtime cost.
+  * ``"threads"``: ``concurrent.futures.ThreadPoolExecutor``. The right
+    pick on any single-machine host, because ``_analyze_one`` is dominated
+    by an HTTP fetch against ``ialirt.imap-mission.com`` (I/O-bound);
+    threads release the GIL during ``socket.recv`` so we get real
+    concurrency with no extra runtime cost.
 
-  * ``"dask"``: ``dask.distributed.Client``. The HPC scale-out path,
-    intended for running this analysis under a batch scheduler like Slurm
-    on Princeton's research HPC. The :mod:`dask` and :mod:`distributed`
-    packages are hard dependencies in ``pyproject.toml``; the test suite
-    exercises the backend end-to-end (see ``tests/test_parallel.py``).
+  * ``"dask"``: ``dask.distributed.Client``. The scale-out path for any
+    environment where someone has already provisioned a Dask cluster, e.g.
+    a ``dask-jobqueue.SLURMCluster`` on Princeton's research HPC, a
+    ``dask-kubernetes`` deploy, or a manually started ``dask-scheduler``.
 
-Auto-detection
---------------
-:func:`parallel_analyze` defaults to ``backend=None``, which means
-*pick the right one for this machine*. The selection is made by
-:func:`_detect_backend`:
+Auto-detection (capability-based, no hardcoded vendor names)
+------------------------------------------------------------
+:func:`parallel_analyze` defaults to ``backend=None``, which calls
+:func:`_detect_backend`. The selection is intentionally based on a single
+*capability* signal — **is a Dask scheduler advertised to this process?**
+— rather than on enumerating "if I'm on Render do X, if I'm on Slurm do Y".
+That kind of enumeration breaks the first time the code runs somewhere new
+(Docker on a private VM, Kubernetes, a bare-metal workstation), so we don't
+do it. The full decision logic is:
 
-  1. If the env var ``IALIRT_PARALLEL_BACKEND`` is set, honor it verbatim
-     (``"threads"`` or ``"dask"``). This is the manual override knob.
-  2. If a known platform-as-a-service env var is present
-     (``RENDER``, ``DYNO`` for Heroku, ``FLY_APP_NAME``, ``VERCEL``), force
-     ``"threads"``. Those hosts are single small containers and have no
-     business spinning up a multi-worker Dask cluster — this guard exists
-     specifically so the live Render free-tier deploy *never* triggers Dask
-     even if some other env var sneaks in.
-  3. If a known HPC batch-scheduler env var is present
-     (``SLURM_JOB_ID`` / ``PBS_JOBID`` / ``LSB_JOBID`` / ``SGE_TASK_ID``),
-     the process is running inside an allocated job on a cluster — switch
-     to ``"dask"``.
-  4. Otherwise fall back to ``"threads"``.
+  1. ``IALIRT_PARALLEL_BACKEND`` env var → honored verbatim
+     (``"threads"`` or ``"dask"``). Manual override.
 
-So in practice:
+  2. A Dask scheduler address is resolvable through Dask's *own*
+     configuration chain — ``DASK_SCHEDULER_ADDRESS`` env var, YAML files
+     in ``~/.config/dask`` or ``/etc/dask``, or programmatic
+     ``dask.config.set``. This is the canonical "I have a cluster"
+     capability flag that every dask-jobqueue / dask-kubernetes /
+     dask-gateway / dask-yarn deployment uses, regardless of host.
+     → ``"dask"``.
 
-  * Local development, CI, Vercel previews, Render production
-        → threads (no env vars match).
-  * ``sbatch run_analysis.slurm`` on Princeton HPC, where the script calls
-    :func:`parallel_analyze` from inside the Slurm allocation
-        → dask (``SLURM_JOB_ID`` is set by Slurm).
-  * Manual override on any host:
-        ``IALIRT_PARALLEL_BACKEND=dask python -m ...``
+  3. A ``dask.distributed.Client`` has already been constructed in this
+     process (the standard pattern on HPC: ``Client(SLURMCluster(...))``
+     before calling :func:`parallel_analyze`).
+     → ``"dask"``.
 
-HPC usage with an externally-built cluster (the recommended pattern, since
-the auto-detection's default local cluster is single-node)::
+  4. Otherwise → ``"threads"``.
+
+This gives correct behavior everywhere with no host-name list to maintain:
+
+  * Laptop, CI, Docker container without cluster config, the live Render
+    deployment, a Vercel preview: nothing advertises a scheduler →
+    threads.
+  * Inside a Slurm batch job on Princeton HPC, after the user has spun up
+    a ``SLURMCluster`` and exported ``DASK_SCHEDULER_ADDRESS`` (the
+    standard dask-jobqueue pattern): scheduler is advertised → dask.
+  * Any future deploy target: same code, no edit required.
+
+HPC usage with an externally-built cluster (recommended pattern)::
 
     from dask_jobqueue import SLURMCluster
     from dask.distributed import Client
@@ -71,6 +77,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any, Protocol
 
+import dask
 from dask.distributed import Client as DaskClient
 from dask.distributed import as_completed as dask_as_completed
 
@@ -81,52 +88,77 @@ log = logging.getLogger(__name__)
 
 _BACKEND_OVERRIDE_ENV = "IALIRT_PARALLEL_BACKEND"
 
-# Hosts where a multi-worker cluster would be wrong on its face: small
-# single-container PaaS deploys. We *always* fall back to threads here even
-# if a stale HPC env var leaks into the process. This is the explicit guard
-# that keeps the live Render free-tier service from ever instantiating Dask.
-_PAAS_HOST_ENV_VARS: tuple[str, ...] = (
-    "RENDER",
-    "RENDER_SERVICE_NAME",
-    "DYNO",  # Heroku
-    "FLY_APP_NAME",  # Fly.io
-    "VERCEL",
-)
 
-# HPC batch schedulers set these inside an allocated job. Presence of any
-# one means we are running on real cluster nodes and should fan out.
-_HPC_SCHEDULER_ENV_VARS: tuple[str, ...] = (
-    "SLURM_JOB_ID",  # Slurm (Princeton HPC default)
-    "PBS_JOBID",  # PBS / Torque
-    "LSB_JOBID",  # IBM LSF
-    "SGE_TASK_ID",  # Sun/Univa/Altair Grid Engine
-)
+def _dask_scheduler_is_active() -> bool:
+    """Return True iff a Dask scheduler is reachable by this process.
+
+    Two sources, in order:
+
+    1. ``dask.config.get("scheduler-address")``. Dask resolves this from
+       the ``DASK_SCHEDULER_ADDRESS`` env var, YAML files in
+       ``~/.config/dask`` or ``/etc/dask``, and programmatic
+       ``dask.config.set(...)`` calls. Every cluster-spawning tool in the
+       Dask ecosystem (``dask-jobqueue``, ``dask-kubernetes``,
+       ``dask-gateway``, ``dask-yarn``, manual ``dask-scheduler``)
+       advertises through one of those channels.
+    2. ``dask.distributed.default_client()``. If user code already
+       constructed a ``Client(cluster)`` in this process — the canonical
+       HPC pattern — that client is registered as the default for the
+       process and we can detect it without touching any env vars.
+
+    Kept as a separate function so tests can stub it independently of the
+    pure env-var detection path.
+    """
+
+    try:
+        if dask.config.get("scheduler-address", default=None):
+            return True
+    except Exception:  # noqa: BLE001 - dask.config may raise on malformed YAML
+        log.debug("dask.config.get('scheduler-address') raised", exc_info=True)
+
+    try:
+        from dask.distributed import default_client
+
+        default_client()
+        return True
+    except ValueError:
+        return False
+    except Exception:  # noqa: BLE001
+        log.debug("default_client() raised unexpectedly", exc_info=True)
+        return False
 
 
 def _detect_backend(env: dict[str, str] | None = None) -> str:
-    """Pick the compute backend appropriate for the current machine.
+    """Pick the compute backend by capability, not by vendor name.
 
-    See module docstring for the full decision table. The ``env`` parameter
-    exists so tests can pass a synthetic environment dict.
+    Decision order (see module docstring for the full rationale):
+      1. ``IALIRT_PARALLEL_BACKEND`` override (``"threads"`` or ``"dask"``).
+      2. ``DASK_SCHEDULER_ADDRESS`` advertised in the environment.
+      3. A scheduler reachable through Dask's own config / default client.
+      4. Default: ``"threads"``.
+
+    The ``env`` parameter exists so tests can pass a synthetic environment
+    dict. When ``env`` is supplied, step (3) is skipped — we don't want a
+    real ambient ``DASK_SCHEDULER_ADDRESS`` (or a Dask YAML file on the
+    developer's laptop) to bleed into a deterministic unit test.
     """
 
     environ = env if env is not None else os.environ
 
     override = environ.get(_BACKEND_OVERRIDE_ENV)
     if override:
-        if override not in {"threads", "dask"}:
-            log.warning(
-                "%s=%r is not a recognized backend; falling back to autodetection.",
-                _BACKEND_OVERRIDE_ENV,
-                override,
-            )
-        else:
+        if override in {"threads", "dask"}:
             return override
+        log.warning(
+            "%s=%r is not a recognized backend; falling back to autodetection.",
+            _BACKEND_OVERRIDE_ENV,
+            override,
+        )
 
-    if any(environ.get(var) for var in _PAAS_HOST_ENV_VARS):
-        return "threads"
+    if environ.get("DASK_SCHEDULER_ADDRESS"):
+        return "dask"
 
-    if any(environ.get(var) for var in _HPC_SCHEDULER_ENV_VARS):
+    if env is None and _dask_scheduler_is_active():
         return "dask"
 
     return "threads"

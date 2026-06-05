@@ -54,63 +54,71 @@ def test_parallel_analyze_dask_backend_runs_end_to_end() -> None:
         assert "any_anomaly" in result["flagged"]
 
 
-def test_detect_backend_defaults_to_threads_on_empty_env() -> None:
+def test_detect_backend_defaults_to_threads_with_no_scheduler() -> None:
+    """The capability question is 'is there a scheduler?', and the answer
+    on a laptop, in CI, inside our Docker image, and on the Render free
+    tier is 'no'. Default has to be threads everywhere those are true."""
+
     assert _detect_backend(env={}) == "threads"
 
 
-def test_detect_backend_returns_threads_on_render() -> None:
-    """The live Render container must never auto-switch to Dask.
+def test_detect_backend_picks_dask_when_scheduler_address_is_advertised() -> None:
+    """``DASK_SCHEDULER_ADDRESS`` is Dask's canonical capability flag —
+    set by ``dask-jobqueue.SLURMCluster``, ``dask-kubernetes``,
+    ``dask-gateway``, ``dask-yarn``, or a manual ``dask-scheduler``.
+    Presence means a real cluster is reachable; we must auto-fan-out.
 
-    This is the explicit PaaS guard: even if a stray HPC env var leaked in,
-    presence of the RENDER signal must win and keep us on threads. Without
-    this guard, a misconfigured deploy could spin up a Dask cluster inside
-    the 512 MB free-tier container and OOM the service.
+    This is the entire reason the detection is capability-based instead of
+    a list of vendor names: the same single signal works for SLURM,
+    Kubernetes, a Docker container with a sidecar scheduler, or any future
+    deploy target nobody has thought of yet.
     """
 
-    assert _detect_backend(env={"RENDER": "true"}) == "threads"
     assert (
-        _detect_backend(env={"RENDER_SERVICE_NAME": "imap-ialirt-explorer-api"})
-        == "threads"
+        _detect_backend(env={"DASK_SCHEDULER_ADDRESS": "tcp://10.0.0.5:8786"})
+        == "dask"
     )
-    # PaaS guard wins over an HPC env var if both were present somehow.
-    assert (
-        _detect_backend(env={"RENDER": "true", "SLURM_JOB_ID": "12345"})
-        == "threads"
-    )
-
-
-def test_detect_backend_returns_dask_inside_slurm_allocation() -> None:
-    """Inside a Slurm batch job (Princeton HPC pattern) we must pick Dask."""
-
-    assert _detect_backend(env={"SLURM_JOB_ID": "12345"}) == "dask"
-
-
-@pytest.mark.parametrize(
-    "scheduler_var", ["SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID"]
-)
-def test_detect_backend_recognizes_each_hpc_scheduler(scheduler_var: str) -> None:
-    assert _detect_backend(env={scheduler_var: "1"}) == "dask"
 
 
 def test_detect_backend_respects_manual_override() -> None:
-    """``IALIRT_PARALLEL_BACKEND`` short-circuits all other detection."""
+    """``IALIRT_PARALLEL_BACKEND`` short-circuits all autodetection."""
 
-    # Override forces threads even on Slurm.
     assert (
         _detect_backend(
-            env={"IALIRT_PARALLEL_BACKEND": "threads", "SLURM_JOB_ID": "1"}
+            env={
+                "IALIRT_PARALLEL_BACKEND": "threads",
+                "DASK_SCHEDULER_ADDRESS": "tcp://10.0.0.5:8786",
+            }
         )
         == "threads"
     )
-    # Override forces dask even on Render.
-    assert (
-        _detect_backend(env={"IALIRT_PARALLEL_BACKEND": "dask", "RENDER": "true"})
-        == "dask"
-    )
-    # Bad override is ignored, autodetection runs normally.
+
+    assert _detect_backend(env={"IALIRT_PARALLEL_BACKEND": "dask"}) == "dask"
+
     assert (
         _detect_backend(env={"IALIRT_PARALLEL_BACKEND": "kubernetes"}) == "threads"
     )
+
+
+def test_detect_backend_consults_dask_config_when_using_real_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``env`` is not supplied, the detector falls through to
+    ``dask.config`` / ``default_client()``. This is the path that catches
+    HPC users who set ``scheduler-address`` in ``~/.config/dask/*.yaml``
+    or programmatically with ``dask.config.set(...)``, without exporting
+    ``DASK_SCHEDULER_ADDRESS`` to the environment.
+    """
+
+    import dask
+
+    monkeypatch.delenv("DASK_SCHEDULER_ADDRESS", raising=False)
+    monkeypatch.delenv("IALIRT_PARALLEL_BACKEND", raising=False)
+
+    with dask.config.set({"scheduler-address": "tcp://10.0.0.5:8786"}):
+        assert _detect_backend() == "dask"
+
+    assert _detect_backend() == "threads"
 
 
 def test_parallel_analyze_accepts_external_dask_client() -> None:
