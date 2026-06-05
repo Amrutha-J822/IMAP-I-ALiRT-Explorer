@@ -13,6 +13,7 @@ authors = [{name = "Amrutha Junnuri"}]
 keywords = ["IMAP", "I-ALiRT", "space weather", "heliophysics", "real time"]
 dependencies = [
   "cdflib>=1.3.4",
+  "dask[distributed]>=2024.5",
   "fastapi>=0.115",
   "httpx>=0.27",
   "ialirt-data-access>=0.10.0",
