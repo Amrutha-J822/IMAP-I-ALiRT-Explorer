@@ -37,3 +37,4 @@ frontend/.vite/
 .vscode/
 .idea/
 .cursor/
+.vercel

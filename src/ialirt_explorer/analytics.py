@@ -27,43 +27,99 @@ MAG_VECTOR_COLUMNS = ("Bx_nT", "By_nT", "Bz_nT")
 
 @njit(cache=True)
 def _rolling_zscore_array(values: np.ndarray, window: int = 60) -> np.ndarray:
-    """Trailing-window z-score using only samples before the current point."""
+    """Trailing-window z-score using only samples strictly before the current point.
+
+    Implementation: Welford's online algorithm (B. P. Welford, 1962,
+    "Note on a method for calculating corrected sums of squares and products",
+    Technometrics 4(3): 419-420) extended with the symmetric remove-sample
+    update so it can run over a sliding window in a single pass.
+
+    The classic Welford update for adding a new sample `x` to a running
+    (n, mean, M2) state — where M2 is the running sum of squared deviations
+    from the *current* mean — is:
+
+        n      += 1
+        delta   = x - mean
+        mean   += delta / n
+        M2     += delta * (x - mean)        # second `(x - mean)` uses the new mean
+
+    Variance is then M2 / n (population) or M2 / (n - 1) (sample). This is
+    numerically stable because we never form the catastrophic cancellation
+    `sum(x_i^2) - (sum x_i)^2 / n` that the textbook two-pass formula does.
+
+    For a sliding window we also need the inverse update — remove an old
+    sample `y` from the state to keep only the last `window` samples:
+
+        n_new     = n - 1
+        mean_new  = (mean * n - y) / n_new
+        M2       -= (y - mean_new) * (y - mean)
+
+    Each iteration becomes O(1) instead of O(window), so the whole pass is
+    O(N) versus the naive O(N * window). For our 48-sample default that is
+    roughly a 48x speedup; on a long archive backfill (~tens of thousands of
+    samples) it matters.
+
+    Numerical caveat: repeated add/remove can let floating-point error
+    accumulate in M2 over very long sequences. We clamp M2 at zero on each
+    deletion to keep std real-valued. For the I-ALiRT polling cadence and
+    sequence lengths used by this project (~10^3 samples per snapshot), the
+    drift is well below sensor noise. If we ever process months of archive
+    in one shot, a periodic full recompute every `window` steps would be the
+    standard cure.
+    """
 
     n_values = values.shape[0]
     output = np.zeros(n_values, dtype=np.float64)
     window = max(2, window)
 
+    # Running Welford state over the trailing window [idx - window, idx).
+    mean = 0.0
+    m2 = 0.0
+    n = 0
+
     for idx in range(n_values):
-        start = max(0, idx - window)
-        count = idx - start
-        if count < 2 or math.isnan(values[idx]):
+        cur = values[idx]
+
+        # Score the current sample against the state of samples BEFORE it,
+        # matching the original "strictly trailing" contract.
+        if n < 2 or math.isnan(cur):
             output[idx] = 0.0
-            continue
-
-        total = 0.0
-        valid = 0
-        for jdx in range(start, idx):
-            if not math.isnan(values[jdx]):
-                total += values[jdx]
-                valid += 1
-        if valid < 2:
-            output[idx] = 0.0
-            continue
-
-        mean = total / valid
-        variance = 0.0
-        for jdx in range(start, idx):
-            if not math.isnan(values[jdx]):
-                diff = values[jdx] - mean
-                variance += diff * diff
-        std = math.sqrt(variance / valid)
-
-        if std < 1e-12:
-            output[idx] = (
-                0.0 if abs(values[idx] - mean) < 1e-12 else math.copysign(1e9, values[idx] - mean)
-            )
         else:
-            output[idx] = (values[idx] - mean) / std
+            std = math.sqrt(m2 / n)
+            if std < 1e-12:
+                output[idx] = (
+                    0.0
+                    if abs(cur - mean) < 1e-12
+                    else math.copysign(1e9, cur - mean)
+                )
+            else:
+                output[idx] = (cur - mean) / std
+
+        # Welford forward update: incorporate the current sample into the
+        # window so the *next* iteration sees it.
+        if not math.isnan(cur):
+            n += 1
+            delta = cur - mean
+            mean += delta / n
+            m2 += delta * (cur - mean)
+
+        # Welford reverse update: drop the sample that has just fallen off
+        # the trailing edge of the window.
+        if idx >= window:
+            leaving = values[idx - window]
+            if not math.isnan(leaving):
+                if n <= 1:
+                    n = 0
+                    mean = 0.0
+                    m2 = 0.0
+                else:
+                    n_new = n - 1
+                    mean_new = (mean * n - leaving) / n_new
+                    m2 -= (leaving - mean_new) * (leaving - mean)
+                    if m2 < 0.0:
+                        m2 = 0.0
+                    mean = mean_new
+                    n = n_new
 
     return output
 

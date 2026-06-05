@@ -134,6 +134,42 @@ def test_rolling_zscore_detects_large_outlier() -> None:
     assert abs(result[40]) > 5
 
 
+def test_rolling_zscore_welford_matches_naive_reference() -> None:
+    """Lock in Welford's add/remove math against a brute-force reference.
+
+    The brute-force implementation reproduces what the function did before we
+    switched to Welford: per-index, two full passes over the trailing window.
+    The Welford version must agree to within floating-point tolerance.
+    """
+
+    rng = np.random.default_rng(seed=42)
+    values = rng.normal(loc=2.5, scale=1.7, size=500).astype(np.float64)
+    values[100] = np.nan
+    values[200:205] = np.nan
+
+    window = 24
+
+    def naive(values: np.ndarray, window: int) -> np.ndarray:
+        out = np.zeros_like(values)
+        for idx in range(len(values)):
+            start = max(0, idx - window)
+            chunk = values[start:idx]
+            chunk = chunk[~np.isnan(chunk)]
+            if chunk.size < 2 or np.isnan(values[idx]):
+                continue
+            mean = chunk.mean()
+            std = chunk.std()
+            if std < 1e-12:
+                continue
+            out[idx] = (values[idx] - mean) / std
+        return out
+
+    fast = _rolling_zscore_array(values, window=window)
+    expected = naive(values, window=window)
+
+    np.testing.assert_allclose(fast, expected, rtol=1e-10, atol=1e-10)
+
+
 @pytest.mark.parametrize("method", CALIBRATION_METHODS)
 def test_calibration_quality_returns_expected_fields(
     mag_df: pd.DataFrame, method: str
