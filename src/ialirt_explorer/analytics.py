@@ -24,9 +24,61 @@ except ImportError:  # pragma: no cover - pure Python fallback is tested instead
 
 MAG_VECTOR_COLUMNS = ("Bx_nT", "By_nT", "Bz_nT")
 
+# Anything whose absolute value exceeds this threshold is treated as a sentinel
+# (CDF FILLVAL=-1e31, ISTP convention -9.9e30, ground-system -9999 as floats
+# scaled to nT, instrument saturation rails written as extreme floats, etc.).
+# No I-ALiRT physical quantity comes anywhere near 1e20 in any unit we plot:
+#   * MAG is bounded by mission spec to a few thousand nT.
+#   * Proton density / temperature / speed are <1e6 in their units.
+#   * HIT/CoDICE rates are <1e9 counts/s.
+# So this threshold is safely far above any real measurement and safely far
+# below every documented FILLVAL convention we care about.
+_FILL_VALUE_MAGNITUDE = 1.0e20
+
+
+def _strip_fill_values(values: np.ndarray) -> np.ndarray:
+    """Map absurd-magnitude sentinel values to NaN before they pollute stats.
+
+    Real I-ALiRT samples that leak a CDF FILLVAL (-1e31), an ISTP-style
+    -9.9e30, or an instrument saturation rail through the parser will
+    otherwise silently destroy Welford running stats and inflate
+    ``np.std``/``np.percentile`` for an entire trailing window — hiding
+    real anomalies. The caller pays an O(N) copy in exchange for not
+    having to trust upstream cleanliness.
+    """
+
+    cleaned = np.asarray(values, dtype=np.float64).copy()
+    bad = ~np.isfinite(cleaned) | (np.abs(cleaned) > _FILL_VALUE_MAGNITUDE)
+    cleaned[bad] = np.nan
+    return cleaned
+
+
+def _datetime_index_to_seconds(index: pd.DatetimeIndex) -> np.ndarray:
+    """Convert a (possibly tz-aware, possibly non-ns-precision) DatetimeIndex
+    to a flat float64 seconds-since-epoch array.
+
+    Pandas 2.x can store datetimes at us/ms/ns resolution, so a raw
+    ``index.view("int64") / 1e9`` silently produces 1000x-wrong seconds
+    values for non-ns frames. We force ns precision explicitly. Tz-aware
+    indices are first stripped to UTC-naive so ``astype('datetime64[ns]')``
+    does not warn about the lossy tz drop.
+    """
+
+    if index.tz is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    return (
+        index.to_numpy().astype("datetime64[ns]").view("int64").astype(np.float64)
+        / 1.0e9
+    )
+
 
 @njit(cache=True)
-def _rolling_zscore_array(values: np.ndarray, window: int = 60) -> np.ndarray:
+def _rolling_zscore_array(
+    values: np.ndarray,
+    window: int = 60,
+    time_seconds: np.ndarray | None = None,
+    max_gap_seconds: float = 0.0,
+) -> np.ndarray:
     """Trailing-window z-score using only samples strictly before the current point.
 
     Implementation: Welford's online algorithm (B. P. Welford, 1962,
@@ -34,51 +86,82 @@ def _rolling_zscore_array(values: np.ndarray, window: int = 60) -> np.ndarray:
     Technometrics 4(3): 419-420) extended with the symmetric remove-sample
     update so it can run over a sliding window in a single pass.
 
-    The classic Welford update for adding a new sample `x` to a running
-    (n, mean, M2) state — where M2 is the running sum of squared deviations
-    from the *current* mean — is:
+    The classic Welford update for adding a new sample ``x`` to a running
+    ``(n, mean, M2)`` state — where ``M2`` is the running sum of squared
+    deviations from the *current* mean — is:
 
         n      += 1
         delta   = x - mean
         mean   += delta / n
         M2     += delta * (x - mean)        # second `(x - mean)` uses the new mean
 
-    Variance is then M2 / n (population) or M2 / (n - 1) (sample). This is
-    numerically stable because we never form the catastrophic cancellation
-    `sum(x_i^2) - (sum x_i)^2 / n` that the textbook two-pass formula does.
+    Variance is then ``M2 / n``. This is numerically stable because we never
+    form the catastrophic cancellation ``sum(x_i^2) - (sum x_i)^2 / n`` that
+    the textbook two-pass formula does.
 
     For a sliding window we also need the inverse update — remove an old
-    sample `y` from the state to keep only the last `window` samples:
+    sample ``y`` from the state:
 
         n_new     = n - 1
         mean_new  = (mean * n - y) / n_new
         M2       -= (y - mean_new) * (y - mean)
 
-    Each iteration becomes O(1) instead of O(window), so the whole pass is
-    O(N) versus the naive O(N * window). For our 48-sample default that is
-    roughly a 48x speedup; on a long archive backfill (~tens of thousands of
-    samples) it matters.
+    Each iteration is O(1), so the whole pass is O(N) vs the naive O(N*window).
+
+    Time-aware gap handling
+    -----------------------
+    Spacecraft telemetry has dropouts — LOS during umbra passes, downlink
+    scheduling, etc. A purely index-based rolling window treats the sample
+    before and after a 4-hour gap as if they were ``cadence`` apart, so a
+    benign baseline shift across the gap fires a spurious spike flag. When
+    ``time_seconds`` is provided and ``max_gap_seconds > 0``, the Welford
+    state is reset whenever the inter-sample gap exceeds the threshold. The
+    sample immediately after a gap is scored against itself (n<2 → 0) and
+    new statistics rebuild from there.
 
     Numerical caveat: repeated add/remove can let floating-point error
-    accumulate in M2 over very long sequences. We clamp M2 at zero on each
-    deletion to keep std real-valued. For the I-ALiRT polling cadence and
-    sequence lengths used by this project (~10^3 samples per snapshot), the
-    drift is well below sensor noise. If we ever process months of archive
-    in one shot, a periodic full recompute every `window` steps would be the
-    standard cure.
+    accumulate in ``M2`` over very long sequences. We clamp ``M2`` at zero
+    on each deletion to keep std real-valued.
     """
 
     n_values = values.shape[0]
     output = np.zeros(n_values, dtype=np.float64)
     window = max(2, window)
 
+    use_time_gaps = (
+        time_seconds is not None
+        and time_seconds.shape[0] == n_values
+        and max_gap_seconds > 0.0
+    )
+
     # Running Welford state over the trailing window [idx - window, idx).
     mean = 0.0
     m2 = 0.0
     n = 0
+    last_time = 0.0
+    have_last_time = False
+
+    # Index of the most recent state reset. The reverse update at index
+    # ``idx`` removes ``values[idx - window]``, but that's only valid if
+    # that sample was ever *added* to the current Welford state. After a
+    # gap reset, samples from before the reset were dropped wholesale —
+    # trying to "remove" them again would underflow ``n`` and the state
+    # never recovers. Tracking this index gates the reverse update so
+    # post-reset Welford behaves correctly.
+    reset_at_index = 0
 
     for idx in range(n_values):
         cur = values[idx]
+
+        # Reset state if the inter-sample gap exceeds the configured budget.
+        # The post-gap sample has no relevant pre-gap history to score against.
+        if use_time_gaps and have_last_time:
+            gap = time_seconds[idx] - last_time
+            if gap > max_gap_seconds or gap < 0.0:
+                n = 0
+                mean = 0.0
+                m2 = 0.0
+                reset_at_index = idx
 
         # Score the current sample against the state of samples BEFORE it,
         # matching the original "strictly trailing" contract.
@@ -104,9 +187,12 @@ def _rolling_zscore_array(values: np.ndarray, window: int = 60) -> np.ndarray:
             m2 += delta * (cur - mean)
 
         # Welford reverse update: drop the sample that has just fallen off
-        # the trailing edge of the window.
-        if idx >= window:
-            leaving = values[idx - window]
+        # the trailing edge of the window. Guarded against post-reset
+        # corruption: we only remove a sample if it was added on or after
+        # the last reset (otherwise it was never in the current state).
+        leaving_idx = idx - window
+        if leaving_idx >= reset_at_index and leaving_idx >= 0:
+            leaving = values[leaving_idx]
             if not math.isnan(leaving):
                 if n <= 1:
                     n = 0
@@ -120,6 +206,10 @@ def _rolling_zscore_array(values: np.ndarray, window: int = 60) -> np.ndarray:
                         m2 = 0.0
                     mean = mean_new
                     n = n_new
+
+        if use_time_gaps:
+            last_time = time_seconds[idx]
+            have_last_time = True
 
     return output
 
@@ -146,23 +236,42 @@ def _rolling_below_threshold(values: np.ndarray, window: int, threshold: float) 
 
 
 def analyze(df: pd.DataFrame) -> dict[str, Any]:
-    """Compute compact quality-control and summary statistics."""
+    """Compute compact quality-control and summary statistics.
+
+    Defensive against three classes of dirty real-world telemetry:
+
+    * **Sentinel / FILLVAL leakage.** Per-column stats are computed only
+      over values that pass :func:`_strip_fill_values`, so a single
+      ``-1e31`` does not turn ``max`` into ``1e31``.
+    * **Non-monotonic index.** Spacecraft packets can arrive out of order;
+      ``duration_hours`` and ``cadence_seconds`` are derived from the
+      timestamp extremes and the *absolute* inter-sample diff, so they
+      never come out negative.
+    * **Duplicate timestamps.** Zero-second diffs are filtered out before
+      taking the cadence median, so a few retransmits don't claim a
+      cadence of 0 s.
+    """
 
     if df.empty:
         return {}
 
     numeric = df.select_dtypes(include=[np.number])
     if len(df.index) > 1 and isinstance(df.index, pd.DatetimeIndex):
-        duration_hours = (df.index[-1] - df.index[0]).total_seconds() / 3600
-        cadence_seconds = float(df.index.to_series().diff().dt.total_seconds().dropna().median())
+        index_seconds = _datetime_index_to_seconds(df.index)
+        duration_hours = (
+            float(index_seconds.max() - index_seconds.min()) / 3600.0
+        )
+        diffs = np.abs(np.diff(index_seconds))
+        positive = diffs[diffs > 0]
+        cadence_seconds = float(np.median(positive)) if positive.size else float("nan")
     else:
         duration_hours = 0.0
         cadence_seconds = float("nan")
 
     column_stats: dict[str, dict[str, float]] = {}
     for column in numeric.columns:
-        values = numeric[column].to_numpy(dtype=np.float64)
-        finite = values[np.isfinite(values)]
+        finite = _strip_fill_values(numeric[column].to_numpy(dtype=np.float64))
+        finite = finite[np.isfinite(finite)]
         if finite.size == 0:
             continue
         column_stats[column] = {
@@ -174,12 +283,19 @@ def analyze(df: pd.DataFrame) -> dict[str, Any]:
             "p95": float(np.percentile(finite, 95)),
         }
 
+    # Count any FILLVAL-magnitude rail as "missing" for the QC fraction — a
+    # row whose vector components are all -1e31 isn't a real measurement.
+    cleaned_numeric = numeric.where(numeric.abs() < _FILL_VALUE_MAGNITUDE)
+    missing_fraction = float(
+        cleaned_numeric.isna().sum().sum() / max(1, cleaned_numeric.size)
+    )
+
     return {
         "n_rows": int(len(df)),
         "n_columns": int(len(df.columns)),
         "duration_hours": float(duration_hours),
         "cadence_seconds": cadence_seconds,
-        "missing_fraction": float(df.isna().sum().sum() / max(1, df.size)),
+        "missing_fraction": missing_fraction,
         "column_stats": column_stats,
     }
 
@@ -202,8 +318,24 @@ def calibrate_mag(df: pd.DataFrame, *, method: str = "offset", window: int = 121
     calibrated = df.copy()
     x = np.arange(len(calibrated), dtype=np.float64)
 
+    # Refuse to silently emit an all-NaN frame for a vector component that
+    # carries no real samples. The caller almost certainly wants to see this
+    # case explicitly (instrument off, bad parser, all FILLVAL upstream)
+    # rather than discover a flat-zero magnitude trace downstream.
     for column in MAG_VECTOR_COLUMNS:
-        series = calibrated[column].astype(float)
+        cleaned = _strip_fill_values(df[column].to_numpy(dtype=np.float64))
+        if not np.any(np.isfinite(cleaned)):
+            raise ValueError(
+                f"MAG calibration requires real samples in {column!r}; "
+                f"received an all-NaN/fill-value column."
+            )
+
+    for column in MAG_VECTOR_COLUMNS:
+        # Substitute FILLVAL-magnitude rails with NaN so they cannot poison
+        # the rolling median (offset), the polyfit baseline (detrend), or the
+        # mean/std (zscore) of an otherwise clean component.
+        cleaned_values = _strip_fill_values(df[column].to_numpy(dtype=np.float64))
+        series = pd.Series(cleaned_values, index=df.index, name=column)
         if method == "offset":
             baseline = series.rolling(
                 window=window, center=True, min_periods=max(5, window // 10)
@@ -252,52 +384,88 @@ def detect_anomalies(
     flags = pd.DataFrame(index=df.index)
     numeric = df.select_dtypes(include=[np.number])
 
+    # Build a seconds-since-epoch array so the Welford pass can detect
+    # large telemetry gaps (LOS, downlink scheduling) and reset its running
+    # mean/M2 instead of comparing post-gap samples against stale pre-gap
+    # statistics. The default budget — 6x the median cadence, floored at
+    # 5 minutes — is generous enough not to fire on routine packet jitter
+    # and tight enough to catch real LOS events.
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 1:
+        time_seconds = _datetime_index_to_seconds(df.index)
+        positive_diffs = np.diff(time_seconds)
+        positive_diffs = positive_diffs[positive_diffs > 0]
+        if positive_diffs.size:
+            cadence = float(np.median(positive_diffs))
+            max_gap_seconds = max(6.0 * cadence, 300.0)
+        else:
+            max_gap_seconds = 0.0
+    else:
+        time_seconds = np.empty(0, dtype=np.float64)
+        max_gap_seconds = 0.0
+
     for column in numeric.columns:
-        zscore = _rolling_zscore_array(numeric[column].to_numpy(dtype=np.float64), window=window)
+        cleaned = _strip_fill_values(numeric[column].to_numpy(dtype=np.float64))
+        zscore = _rolling_zscore_array(
+            cleaned,
+            window=window,
+            time_seconds=time_seconds,
+            max_gap_seconds=max_gap_seconds,
+        )
         flags[f"{column}_zscore"] = zscore
         flags[f"{column}_spike"] = np.abs(zscore) >= sigma_threshold
 
+    # Each threshold check below reads from ``clean_df`` rather than ``df``
+    # so a FILLVAL of either sign (+1e31, -9.9e30) cannot trip a physical
+    # threshold flag (e.g. ``high_speed_stream`` would otherwise fire on a
+    # FILLVAL of +1e31 dressed as a proton speed).
+    clean_df = df.where(numeric.abs() < _FILL_VALUE_MAGNITUDE)
+
     if instrument == "mag" and "Bz_nT" in df:
         flags["storm_southward_Bz"] = _rolling_below_threshold(
-            df["Bz_nT"].to_numpy(dtype=np.float64),
+            _strip_fill_values(df["Bz_nT"].to_numpy(dtype=np.float64)),
             window=max(6, min(window, 24)),
             threshold=-5.0,
         )
         if "B_total_nT" in df:
-            flags["strong_field"] = df["B_total_nT"].to_numpy(dtype=np.float64) >= 15.0
+            flags["strong_field"] = (
+                clean_df["B_total_nT"].to_numpy(dtype=np.float64) >= 15.0
+            )
     elif instrument == "swapi":
         if "proton_speed_km_s" in df:
-            flags["high_speed_stream"] = df["proton_speed_km_s"].to_numpy(dtype=np.float64) >= 650.0
+            flags["high_speed_stream"] = (
+                clean_df["proton_speed_km_s"].to_numpy(dtype=np.float64) >= 650.0
+            )
         if "proton_density_cc" in df:
             flags["density_compression"] = (
-                df["proton_density_cc"].to_numpy(dtype=np.float64) >= 12.0
+                clean_df["proton_density_cc"].to_numpy(dtype=np.float64) >= 12.0
             )
     elif instrument == "hit":
         rate_cols = [column for column in df.columns if column.endswith("_en")]
         if rate_cols:
-            baseline = df[rate_cols].median().replace(0, 1.0)
+            baseline = clean_df[rate_cols].median().replace(0, 1.0)
             flags["energetic_particle_enhancement"] = (
-                df[rate_cols] > 4 * baseline
+                clean_df[rate_cols] > 4 * baseline
             ).any(axis=1)
     elif instrument == "swe":
         if "electron_counts_max" in df:
             flags["electron_burst"] = (
-                df["electron_counts_max"].to_numpy(dtype=np.float64) >= 200.0
+                clean_df["electron_counts_max"].to_numpy(dtype=np.float64) >= 200.0
             )
         if "counterstreaming_flag" in df:
             flags["counterstreaming_electrons"] = (
-                df["counterstreaming_flag"].fillna(0).to_numpy(dtype=np.float64) >= 1.0
+                clean_df["counterstreaming_flag"].fillna(0).to_numpy(dtype=np.float64)
+                >= 1.0
             )
     elif instrument in {"codice_lo", "codice_hi"}:
         numeric_cols = [
             column for column in df.columns if pd.api.types.is_numeric_dtype(df[column])
         ]
         if numeric_cols:
-            valid = df[numeric_cols].dropna(how="all")
+            valid = clean_df[numeric_cols].dropna(how="all")
             if not valid.empty:
                 baseline = valid.median(skipna=True).replace(0, 1.0)
                 flags["composition_excursion"] = (
-                    (df[numeric_cols] > 3 * baseline).any(axis=1).fillna(False)
+                    (clean_df[numeric_cols] > 3 * baseline).any(axis=1).fillna(False)
                 )
 
     boolean_cols = [
