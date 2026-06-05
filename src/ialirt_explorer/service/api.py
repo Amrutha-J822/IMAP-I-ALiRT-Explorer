@@ -102,9 +102,10 @@ def create_app(
             "Live ingestion and analytics for the public IMAP I-ALiRT space-weather "
             "feed (https://ialirt.imap-mission.com). Exposes REST endpoints for "
             "one-shot queries, calibration helpers, and a WebSocket for pub/sub "
-            "delivery of new samples per instrument."
+            "delivery of new samples per instrument. Synthetic-fallback paths are "
+            "disabled in this build; empty upstream windows surface as empty frames."
         ),
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
